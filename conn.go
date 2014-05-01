@@ -6,13 +6,12 @@ package gocql
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 )
 
 const defaultFrameSize = 4096
@@ -176,7 +175,7 @@ func (c *Conn) startup(cfg *ConnConfig) error {
 			}
 			return nil
 		default:
-			return ErrProtocol
+			return NewErrProtocol("Unknown type of response to startup frame: %s", x)
 		}
 	}
 }
@@ -237,7 +236,7 @@ func (c *Conn) recv() (frame, error) {
 		}
 		if n == headerSize && len(resp) == headerSize {
 			if resp[0] != c.version|flagResponse {
-				return nil, ErrProtocol
+				return nil, NewErrProtocol("recv: Response protocol version does not match connection protocol version (%d != %d)", resp[0], c.version|flagResponse)
 			}
 			resp.grow(resp.Length())
 		}
@@ -344,7 +343,7 @@ func (c *Conn) prepareStatement(stmt string, trace Tracer) (*queryInfo, error) {
 		case error:
 			flight.err = x
 		default:
-			flight.err = ErrProtocol
+			flight.err = NewErrProtocol("Unknown type in response to prepare frame: %s", x)
 		}
 	}
 
@@ -359,27 +358,6 @@ func (c *Conn) prepareStatement(stmt string, trace Tracer) (*queryInfo, error) {
 	return flight.info, flight.err
 }
 
-func shouldPrepare(stmt string) bool {
-	stmt = strings.TrimLeftFunc(strings.TrimRightFunc(stmt, func(r rune) bool {
-		return unicode.IsSpace(r) || r == ';'
-	}), unicode.IsSpace)
-
-	var stmtType string
-	if n := strings.IndexFunc(stmt, unicode.IsSpace); n >= 0 {
-		stmtType = strings.ToLower(stmt[:n])
-	}
-	if stmtType == "begin" {
-		if n := strings.LastIndexFunc(stmt, unicode.IsSpace); n >= 0 {
-			stmtType = strings.ToLower(stmt[n+1:])
-		}
-	}
-	switch stmtType {
-	case "select", "insert", "update", "delete", "batch":
-		return true
-	}
-	return false
-}
-
 func (c *Conn) executeQuery(qry *Query) *Iter {
 	op := &queryFrame{
 		Stmt:      qry.stmt,
@@ -387,7 +365,7 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		PageSize:  qry.pageSize,
 		PageState: qry.pageState,
 	}
-	if shouldPrepare(op.Stmt) {
+	if qry.shouldPrepare() {
 		// Prepare all DML queries. Other queries can not be prepared.
 		info, err := c.prepareStatement(qry.stmt, qry.trace)
 		if err != nil {
@@ -426,7 +404,7 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 	case resultKeyspaceFrame:
 		return &Iter{}
 	case errorFrame:
-		if x.Code == errUnprepared && len(qry.values) > 0 {
+		if x.Code() == errUnprepared && len(qry.values) > 0 {
 			c.prepMu.Lock()
 			if val, ok := c.prep[qry.stmt]; ok && val != nil {
 				delete(c.prep, qry.stmt)
@@ -441,12 +419,12 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 	case error:
 		return &Iter{err: x}
 	default:
-		return &Iter{err: ErrProtocol}
+		return &Iter{err: NewErrProtocol("Unknown type in response to execute query: %s", x)}
 	}
 }
 
 func (c *Conn) Pick(qry *Query) *Conn {
-	if c.Closed() || len(c.uniq) == 0 {
+	if c.Closed() {
 		return nil
 	}
 	return c
@@ -485,7 +463,7 @@ func (c *Conn) UseKeyspace(keyspace string) error {
 	case error:
 		return x
 	default:
-		return ErrProtocol
+		return NewErrProtocol("Unknown type in response to USE: %s", x)
 	}
 	return nil
 }
@@ -531,25 +509,43 @@ func (c *Conn) executeBatch(batch *Batch) error {
 	switch x := resp.(type) {
 	case resultVoidFrame:
 		return nil
+	case errRespUnprepared:
+		c.prepMu.Lock()
+		found := false
+		for stmt, flight := range c.prep {
+			if bytes.Equal(flight.info.id, x.StatementId) {
+				found := true
+				delete(c.prep, stmt)
+				break
+			}
+		}
+		c.prepMu.Unlock()
+		if found {
+			return c.executeBatch(batch)
+		} else {
+			return x
+		}
 	case error:
 		return x
 	default:
-		return ErrProtocol
+		return NewErrProtocol("Unknown type in response to batch statement: %s", x)
 	}
 }
 
 func (c *Conn) decodeFrame(f frame, trace Tracer) (rval interface{}, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			if e, ok := r.(error); ok && e == ErrProtocol {
+			if e, ok := r.(ErrProtocol); ok {
 				err = e
 				return
 			}
 			panic(r)
 		}
 	}()
-	if len(f) < headerSize || (f[0] != c.version|flagResponse) {
-		return nil, ErrProtocol
+	if len(f) < headerSize {
+		return nil, NewErrProtocol("Decoding frame: less data received than required for header: %d < %d", len(f), headerSize)
+	} else if f[0] != c.version|flagResponse {
+		return nil, NewErrProtocol("Decoding frame: response protocol version does not match connection protocol version (%d != %d)", f[0], c.version|flagResponse)
 	}
 	flags, op, f := f[1], f[3], f[headerSize:]
 	if flags&flagCompress != 0 && len(f) > 0 && c.compressor != nil {
@@ -561,7 +557,7 @@ func (c *Conn) decodeFrame(f frame, trace Tracer) (rval interface{}, err error) 
 	}
 	if flags&flagTrace != 0 {
 		if len(f) < 16 {
-			return nil, ErrProtocol
+			return nil, NewErrProtocol("Decoding frame: length of frame less than 16 while tracing is enabled")
 		}
 		traceId := []byte(f[:16])
 		f = f[16:]
@@ -597,7 +593,7 @@ func (c *Conn) decodeFrame(f frame, trace Tracer) (rval interface{}, err error) 
 		case resultKindSchemaChanged:
 			return resultVoidFrame{}, nil
 		default:
-			return nil, ErrProtocol
+			return nil, NewErrProtocol("Decoding frame: unknown result kind %s", kind)
 		}
 	case opAuthenticate:
 		return authenticateFrame{f.readString()}, nil
@@ -608,11 +604,9 @@ func (c *Conn) decodeFrame(f frame, trace Tracer) (rval interface{}, err error) 
 	case opSupported:
 		return supportedFrame{}, nil
 	case opError:
-		code := f.readInt()
-		msg := f.readString()
-		return errorFrame{code, msg}, nil
+		return f.readError(), nil
 	default:
-		return nil, ErrProtocol
+		return nil, NewErrProtocol("Decoding frame: unknown op", op)
 	}
 }
 
@@ -637,4 +631,3 @@ type inflightPrepare struct {
 	err  error
 	wg   sync.WaitGroup
 }
-
