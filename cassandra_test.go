@@ -187,8 +187,6 @@ func TestTracing(t *testing.T) {
 
 func TestPaging(t *testing.T) {
 
-	t.Skip("Skip until https://github.com/gocql/gocql/issues/110 is resolved")
-
 	if *flagProto == 1 {
 		t.Skip("Paging not supported. Please use Cassandra >= 2.0")
 	}
@@ -196,16 +194,16 @@ func TestPaging(t *testing.T) {
 	session := createSession(t)
 	defer session.Close()
 
-	if err := session.Query("CREATE TABLE large (id int primary key)").Exec(); err != nil {
+	if err := session.Query("CREATE TABLE paging (id int primary key)").Exec(); err != nil {
 		t.Fatal("create table:", err)
 	}
 	for i := 0; i < 100; i++ {
-		if err := session.Query("INSERT INTO large (id) VALUES (?)", i).Exec(); err != nil {
+		if err := session.Query("INSERT INTO paging (id) VALUES (?)", i).Exec(); err != nil {
 			t.Fatal("insert:", err)
 		}
 	}
 
-	iter := session.Query("SELECT id FROM large").PageSize(10).Iter()
+	iter := session.Query("SELECT id FROM paging").PageSize(10).Iter()
 	var id int
 	count := 0
 	for iter.Scan(&id) {
@@ -573,4 +571,61 @@ func TestScanCASWithNilArguments(t *testing.T) {
 	} else if foo != cas {
 		t.Fatalf("expected %v but got %v", foo, cas)
 	}
+}
+
+func injectInvalidPreparedStatement(t *testing.T, session *Session, table string) (string, *Conn) {
+	if err := session.Query(`CREATE TABLE ` + table + ` (
+			foo   varchar,
+			bar   int,
+			PRIMARY KEY (foo, bar)
+	)`).Exec(); err != nil {
+		t.Fatal("create:", err)
+	}
+	stmt := "INSERT INTO " + table + " (foo, bar) VALUES (?, 7)"
+	conn := session.Pool.Pick(nil)
+	conn.prepMu.Lock()
+	flight := new(inflightPrepare)
+	conn.prep[stmt] = flight
+	flight.info = &queryInfo{
+		id: []byte{'f', 'o', 'o', 'b', 'a', 'r'},
+		args: []ColumnInfo{ColumnInfo{
+			Keyspace: "gocql_test",
+			Table:    table,
+			Name:     "foo",
+			TypeInfo: &TypeInfo{
+				Type: TypeVarchar,
+			},
+		}, ColumnInfo{
+			Keyspace: "gocql_test",
+			Table:    table,
+			Name:     "bar",
+			TypeInfo: &TypeInfo{
+				Type: TypeInt,
+			},
+		}},
+	}
+	conn.prepMu.Unlock()
+	return stmt, conn
+}
+
+func TestReprepareStatement(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+	stmt, conn := injectInvalidPreparedStatement(t, session, "test_reprepare_statement")
+	query := session.Query(stmt, "bar")
+	if err := conn.executeQuery(query).Close(); err != nil {
+		t.Fatalf("Failed to execute query for reprepare statement: %v", err)
+	}
+}
+
+func TestReprepareBatch(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+	stmt, conn := injectInvalidPreparedStatement(t, session, "test_reprepare_statement_batch")
+	batch := session.NewBatch(UnloggedBatch)
+	batch.Query(stmt, "bar")
+	if err := conn.executeBatch(batch); err != nil {
+		t.Fatalf("Failed to execute query for reprepare statement: %v", err)
+	}
+
 }

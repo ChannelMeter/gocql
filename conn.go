@@ -18,10 +18,6 @@ const defaultFrameSize = 4096
 const flagResponse = 0x80
 const maskVersion = 0x7F
 
-type Cluster interface {
-	HandleError(conn *Conn, err error, closed bool)
-}
-
 type Authenticator interface {
 	Challenge(req []byte) (resp []byte, auth Authenticator, err error)
 	Success(data []byte) error
@@ -73,7 +69,7 @@ type Conn struct {
 	prepMu sync.Mutex
 	prep   map[string]*inflightPrepare
 
-	cluster    Cluster
+	pool       ConnectionPool
 	compressor Compressor
 	auth       Authenticator
 	addr       string
@@ -85,7 +81,7 @@ type Conn struct {
 
 // Connect establishes a connection to a Cassandra node.
 // You must also call the Serve method before you can execute any queries.
-func Connect(addr string, cfg ConnConfig, cluster Cluster) (*Conn, error) {
+func Connect(addr string, cfg ConnConfig, pool ConnectionPool) (*Conn, error) {
 	conn, err := net.DialTimeout("tcp", addr, cfg.Timeout)
 	if err != nil {
 		return nil, err
@@ -106,7 +102,7 @@ func Connect(addr string, cfg ConnConfig, cluster Cluster) (*Conn, error) {
 		timeout:    cfg.Timeout,
 		version:    uint8(cfg.ProtoVersion),
 		addr:       conn.RemoteAddr().String(),
-		cluster:    cluster,
+		pool:       pool,
 		compressor: cfg.Compressor,
 		auth:       cfg.Authenticator,
 	}
@@ -204,7 +200,7 @@ func (c *Conn) serve() {
 			req.resp <- callResp{nil, err}
 		}
 	}
-	c.cluster.HandleError(c, err, true)
+	c.pool.HandleError(c, err, true)
 }
 
 func (c *Conn) recv() (frame, error) {
@@ -403,19 +399,15 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		return iter
 	case resultKeyspaceFrame:
 		return &Iter{}
-	case errorFrame:
-		if x.Code() == errUnprepared && len(qry.values) > 0 {
-			c.prepMu.Lock()
-			if val, ok := c.prep[qry.stmt]; ok && val != nil {
-				delete(c.prep, qry.stmt)
-				c.prepMu.Unlock()
-				return c.executeQuery(qry)
-			}
+	case RequestErrUnprepared:
+		c.prepMu.Lock()
+		if val, ok := c.prep[qry.stmt]; ok && val != nil {
+			delete(c.prep, qry.stmt)
 			c.prepMu.Unlock()
-			return &Iter{err: x}
-		} else {
-			return &Iter{err: x}
+			return c.executeQuery(qry)
 		}
+		c.prepMu.Unlock()
+		return &Iter{err: x}
 	case error:
 		return &Iter{err: x}
 	default:
@@ -509,7 +501,7 @@ func (c *Conn) executeBatch(batch *Batch) error {
 	switch x := resp.(type) {
 	case resultVoidFrame:
 		return nil
-	case errRespUnprepared:
+	case RequestErrUnprepared:
 		c.prepMu.Lock()
 		found := false
 		for stmt, flight := range c.prep {
