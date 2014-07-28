@@ -6,7 +6,7 @@ package gocql
 
 import (
 	"bufio"
-	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -66,9 +66,6 @@ type Conn struct {
 	calls []callReq
 	nwait int32
 
-	prepMu sync.Mutex
-	prep   map[string]*inflightPrepare
-
 	pool       ConnectionPool
 	compressor Compressor
 	auth       Authenticator
@@ -98,7 +95,6 @@ func Connect(addr string, cfg ConnConfig, pool ConnectionPool) (*Conn, error) {
 		r:          bufio.NewReader(conn),
 		uniq:       make(chan uint8, cfg.NumStreams),
 		calls:      make([]callReq, cfg.NumStreams),
-		prep:       make(map[string]*inflightPrepare),
 		timeout:    cfg.Timeout,
 		version:    uint8(cfg.ProtoVersion),
 		addr:       conn.RemoteAddr().String(),
@@ -312,19 +308,19 @@ func (c *Conn) ping() error {
 	return err
 }
 
-func (c *Conn) prepareStatement(stmt string, trace Tracer) (*queryInfo, error) {
-	c.prepMu.Lock()
-	flight := c.prep[stmt]
-	if flight != nil {
-		c.prepMu.Unlock()
+func (c *Conn) prepareStatement(stmt string, trace Tracer) (*QueryInfo, error) {
+	stmtsLRU.mu.Lock()
+	if val, ok := stmtsLRU.lru.Get(c.addr + stmt); ok {
+		flight := val.(*inflightPrepare)
+		stmtsLRU.mu.Unlock()
 		flight.wg.Wait()
 		return flight.info, flight.err
 	}
 
-	flight = new(inflightPrepare)
+	flight := new(inflightPrepare)
 	flight.wg.Add(1)
-	c.prep[stmt] = flight
-	c.prepMu.Unlock()
+	stmtsLRU.lru.Add(c.addr+stmt, flight)
+	stmtsLRU.mu.Unlock()
 
 	resp, err := c.exec(&prepareFrame{Stmt: stmt}, trace)
 	if err != nil {
@@ -332,9 +328,10 @@ func (c *Conn) prepareStatement(stmt string, trace Tracer) (*queryInfo, error) {
 	} else {
 		switch x := resp.(type) {
 		case resultPreparedFrame:
-			flight.info = &queryInfo{
-				id:   x.PreparedId,
-				args: x.Values,
+			flight.info = &QueryInfo{
+				Id:   x.PreparedId,
+				Args: x.Arguments,
+				Rval: x.ReturnValues,
 			}
 		case error:
 			flight.err = x
@@ -346,9 +343,9 @@ func (c *Conn) prepareStatement(stmt string, trace Tracer) (*queryInfo, error) {
 	flight.wg.Done()
 
 	if err != nil {
-		c.prepMu.Lock()
-		delete(c.prep, stmt)
-		c.prepMu.Unlock()
+		stmtsLRU.mu.Lock()
+		stmtsLRU.lru.Remove(c.addr + stmt)
+		stmtsLRU.mu.Unlock()
 	}
 
 	return flight.info, flight.err
@@ -367,10 +364,25 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		if err != nil {
 			return &Iter{err: err}
 		}
-		op.Prepared = info.id
-		op.Values = make([][]byte, len(qry.values))
-		for i := 0; i < len(qry.values); i++ {
-			val, err := Marshal(info.args[i].TypeInfo, qry.values[i])
+
+		var values []interface{}
+
+		if qry.binding == nil {
+			values = qry.values
+		} else {
+			values, err = qry.binding(info)
+			if err != nil {
+				return &Iter{err: err}
+			}
+		}
+
+		if len(values) != len(info.Args) {
+			return &Iter{err: ErrQueryArgLength}
+		}
+		op.Prepared = info.Id
+		op.Values = make([][]byte, len(values))
+		for i := 0; i < len(values); i++ {
+			val, err := Marshal(info.Args[i].TypeInfo, values[i])
 			if err != nil {
 				return &Iter{err: err}
 			}
@@ -400,13 +412,13 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 	case resultKeyspaceFrame:
 		return &Iter{}
 	case RequestErrUnprepared:
-		c.prepMu.Lock()
-		if val, ok := c.prep[qry.stmt]; ok && val != nil {
-			delete(c.prep, qry.stmt)
-			c.prepMu.Unlock()
+		stmtsLRU.mu.Lock()
+		if _, ok := stmtsLRU.lru.Get(c.addr + qry.stmt); ok {
+			stmtsLRU.lru.Remove(c.addr + qry.stmt)
+			stmtsLRU.mu.Unlock()
 			return c.executeQuery(qry)
 		}
-		c.prepMu.Unlock()
+		stmtsLRU.mu.Unlock()
 		return &Iter{err: x}
 	case error:
 		return &Iter{err: x}
@@ -468,24 +480,43 @@ func (c *Conn) executeBatch(batch *Batch) error {
 	f.setHeader(c.version, 0, 0, opBatch)
 	f.writeByte(byte(batch.Type))
 	f.writeShort(uint16(len(batch.Entries)))
+
+	stmts := make(map[string]string)
+
 	for i := 0; i < len(batch.Entries); i++ {
 		entry := &batch.Entries[i]
-		var info *queryInfo
-		if len(entry.Args) > 0 {
+		var info *QueryInfo
+		var args []interface{}
+		if len(entry.Args) > 0 || entry.binding != nil {
 			var err error
 			info, err = c.prepareStatement(entry.Stmt, nil)
+
+			if entry.binding == nil {
+				args = entry.Args
+			} else {
+				args, err = entry.binding(info)
+				if err != nil {
+					return err
+				}
+			}
+
+			if len(args) != len(info.Args) {
+				return ErrQueryArgLength
+			}
+
+			stmts[string(info.Id)] = entry.Stmt
 			if err != nil {
 				return err
 			}
 			f.writeByte(1)
-			f.writeShortBytes(info.id)
+			f.writeShortBytes(info.Id)
 		} else {
 			f.writeByte(0)
 			f.writeLongString(entry.Stmt)
 		}
-		f.writeShort(uint16(len(entry.Args)))
-		for j := 0; j < len(entry.Args); j++ {
-			val, err := Marshal(info.args[j].TypeInfo, entry.Args[j])
+		f.writeShort(uint16(len(args)))
+		for j := 0; j < len(args); j++ {
+			val, err := Marshal(info.Args[j].TypeInfo, args[j])
 			if err != nil {
 				return err
 			}
@@ -502,19 +533,12 @@ func (c *Conn) executeBatch(batch *Batch) error {
 	case resultVoidFrame:
 		return nil
 	case RequestErrUnprepared:
-		c.prepMu.Lock()
-		found := false
-		for stmt, flight := range c.prep {
-			if flight == nil || flight.info == nil {
-				continue
-			}
-			if bytes.Equal(flight.info.id, x.StatementId) {
-				found = true
-				delete(c.prep, stmt)
-				break
-			}
+		stmt, found := stmts[string(x.StatementId)]
+		if found {
+			stmtsLRU.mu.Lock()
+			stmtsLRU.lru.Remove(c.addr + stmt)
+			stmtsLRU.mu.Unlock()
 		}
-		c.prepMu.Unlock()
 		if found {
 			return c.executeBatch(batch)
 		} else {
@@ -583,8 +607,12 @@ func (c *Conn) decodeFrame(f frame, trace Tracer) (rval interface{}, err error) 
 			return resultKeyspaceFrame{keyspace}, nil
 		case resultKindPrepared:
 			id := f.readShortBytes()
-			values, _ := f.readMetaData()
-			return resultPreparedFrame{id, values}, nil
+			args, _ := f.readMetaData()
+			if c.version < 2 {
+				return resultPreparedFrame{PreparedId: id, Arguments: args}, nil
+			}
+			rvals, _ := f.readMetaData()
+			return resultPreparedFrame{PreparedId: id, Arguments: args, ReturnValues: rvals}, nil
 		case resultKindSchemaChanged:
 			return resultVoidFrame{}, nil
 		default:
@@ -605,10 +633,24 @@ func (c *Conn) decodeFrame(f frame, trace Tracer) (rval interface{}, err error) 
 	}
 }
 
-type queryInfo struct {
-	id   []byte
-	args []ColumnInfo
-	rval []ColumnInfo
+func (c *Conn) setKeepalive(d time.Duration) error {
+	if tc, ok := c.conn.(*net.TCPConn); ok {
+		err := tc.SetKeepAlivePeriod(d)
+		if err != nil {
+			return err
+		}
+
+		return tc.SetKeepAlive(true)
+	}
+
+	return nil
+}
+
+// QueryInfo represents the meta data associated with a prepared CQL statement.
+type QueryInfo struct {
+	Id   []byte
+	Args []ColumnInfo
+	Rval []ColumnInfo
 }
 
 type callReq struct {
@@ -622,7 +664,11 @@ type callResp struct {
 }
 
 type inflightPrepare struct {
-	info *queryInfo
+	info *QueryInfo
 	err  error
 	wg   sync.WaitGroup
 }
+
+var (
+	ErrQueryArgLength = errors.New("query argument length mismatch")
+)

@@ -8,12 +8,13 @@ import (
 	"bytes"
 	"flag"
 	"reflect"
-	"sort"
 	"speter.net/go/exp/math/dec/inf"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 )
 
 var (
@@ -24,7 +25,7 @@ var (
 
 var initOnce sync.Once
 
-func createSession(t *testing.T) *Session {
+func createSession(tb testing.TB) *Session {
 	cluster := NewCluster(strings.Split(*flagCluster, ",")...)
 	cluster.ProtoVersion = *flagProto
 	cluster.CQLVersion = *flagCQL
@@ -36,26 +37,26 @@ func createSession(t *testing.T) *Session {
 	initOnce.Do(func() {
 		session, err := cluster.CreateSession()
 		if err != nil {
-			t.Fatal("createSession:", err)
+			tb.Fatal("createSession:", err)
 		}
 		// Drop and re-create the keyspace once. Different tests should use their own
 		// individual tables, but can assume that the table does not exist before.
 		if err := session.Query(`DROP KEYSPACE gocql_test`).Exec(); err != nil {
-			t.Log("drop keyspace:", err)
+			tb.Log("drop keyspace:", err)
 		}
 		if err := session.Query(`CREATE KEYSPACE gocql_test
 			WITH replication = {
 				'class' : 'SimpleStrategy',
 				'replication_factor' : 1
 			}`).Exec(); err != nil {
-			t.Fatal("create keyspace:", err)
+			tb.Fatal("create keyspace:", err)
 		}
 		session.Close()
 	})
 	cluster.Keyspace = "gocql_test"
 	session, err := cluster.CreateSession()
 	if err != nil {
-		t.Fatal("createSession:", err)
+		tb.Fatal("createSession:", err)
 	}
 
 	return session
@@ -100,63 +101,6 @@ func TestInvalidKeyspace(t *testing.T) {
 	}
 }
 
-func TestCRUD(t *testing.T) {
-	session := createSession(t)
-	defer session.Close()
-
-	if err := session.Query(`CREATE TABLE page (
-			title       varchar,
-			revid       timeuuid,
-			body        varchar,
-			views       bigint,
-			protected   boolean,
-			modified    timestamp,
-			rating      decimal,
-			tags        set<varchar>,
-			attachments map<varchar, text>,
-			PRIMARY KEY (title, revid)
-		)`).Exec(); err != nil {
-		t.Fatal("create table:", err)
-	}
-
-	for _, page := range pageTestData {
-		if err := session.Query(`INSERT INTO page
-			(title, revid, body, views, protected, modified, rating, tags, attachments)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			page.Title, page.RevId, page.Body, page.Views, page.Protected,
-			page.Modified, page.Rating, page.Tags, page.Attachments).Exec(); err != nil {
-			t.Fatal("insert:", err)
-		}
-	}
-
-	var count int
-	if err := session.Query("SELECT COUNT(*) FROM page").Scan(&count); err != nil {
-		t.Error("select count:", err)
-	}
-	if count != len(pageTestData) {
-		t.Errorf("count: expected %d, got %d\n", len(pageTestData), count)
-	}
-
-	for _, original := range pageTestData {
-		page := new(Page)
-		err := session.Query(`SELECT title, revid, body, views, protected, modified,
-			tags, attachments, rating
-			FROM page WHERE title = ? AND revid = ? LIMIT 1`,
-			original.Title, original.RevId).Scan(&page.Title, &page.RevId,
-			&page.Body, &page.Views, &page.Protected, &page.Modified, &page.Tags,
-			&page.Attachments, &page.Rating)
-		if err != nil {
-			t.Error("select page:", err)
-			continue
-		}
-		sort.Sort(sort.StringSlice(page.Tags))
-		sort.Sort(sort.StringSlice(original.Tags))
-		if !reflect.DeepEqual(page, original) {
-			t.Errorf("page: expected %#v, got %#v\n", original, page)
-		}
-	}
-}
-
 func TestTracing(t *testing.T) {
 	session := createSession(t)
 	defer session.Close()
@@ -186,7 +130,6 @@ func TestTracing(t *testing.T) {
 }
 
 func TestPaging(t *testing.T) {
-
 	if *flagProto == 1 {
 		t.Skip("Paging not supported. Please use Cassandra >= 2.0")
 	}
@@ -307,6 +250,79 @@ func TestBatchLimit(t *testing.T) {
 
 }
 
+// TestTooManyQueryArgs tests to make sure the library correctly handles the application level bug
+// whereby too many query arguments are passed to a query
+func TestTooManyQueryArgs(t *testing.T) {
+	if *flagProto == 1 {
+		t.Skip("atomic batches not supported. Please use Cassandra >= 2.0")
+	}
+	session := createSession(t)
+	defer session.Close()
+
+	if err := session.Query(`CREATE TABLE too_many_query_args (id int primary key, value int)`).Exec(); err != nil {
+		t.Fatal("create table:", err)
+	}
+
+	_, err := session.Query(`SELECT * FROM too_many_query_args WHERE id = ?`, 1, 2).Iter().SliceMap()
+
+	if err == nil {
+		t.Fatal("'`SELECT * FROM too_many_query_args WHERE id = ?`, 1, 2' should return an ErrQueryArgLength")
+	}
+
+	if err != ErrQueryArgLength {
+		t.Fatalf("'`SELECT * FROM too_many_query_args WHERE id = ?`, 1, 2' should return an ErrQueryArgLength, but returned: %s", err)
+	}
+
+	batch := session.NewBatch(UnloggedBatch)
+	batch.Query("INSERT INTO too_many_query_args (id, value) VALUES (?, ?)", 1, 2, 3)
+	err = session.ExecuteBatch(batch)
+
+	if err == nil {
+		t.Fatal("'`INSERT INTO too_many_query_args (id, value) VALUES (?, ?)`, 1, 2, 3' should return an ErrQueryArgLength")
+	}
+
+	if err != ErrQueryArgLength {
+		t.Fatalf("'INSERT INTO too_many_query_args (id, value) VALUES (?, ?)`, 1, 2, 3' should return an ErrQueryArgLength, but returned: %s", err)
+	}
+
+}
+
+// TestNotEnoughQueryArgs tests to make sure the library correctly handles the application level bug
+// whereby not enough query arguments are passed to a query
+func TestNotEnoughQueryArgs(t *testing.T) {
+	if *flagProto == 1 {
+		t.Skip("atomic batches not supported. Please use Cassandra >= 2.0")
+	}
+	session := createSession(t)
+	defer session.Close()
+
+	if err := session.Query(`CREATE TABLE not_enough_query_args (id int, cluster int, value int, primary key (id, cluster))`).Exec(); err != nil {
+		t.Fatal("create table:", err)
+	}
+
+	_, err := session.Query(`SELECT * FROM not_enough_query_args WHERE id = ? and cluster = ?`, 1).Iter().SliceMap()
+
+	if err == nil {
+		t.Fatal("'`SELECT * FROM not_enough_query_args WHERE id = ? and cluster = ?`, 1' should return an ErrQueryArgLength")
+	}
+
+	if err != ErrQueryArgLength {
+		t.Fatalf("'`SELECT * FROM too_few_query_args WHERE id = ? and cluster = ?`, 1' should return an ErrQueryArgLength, but returned: %s", err)
+	}
+
+	batch := session.NewBatch(UnloggedBatch)
+	batch.Query("INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)", 1, 2)
+	err = session.ExecuteBatch(batch)
+
+	if err == nil {
+		t.Fatal("'`INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)`, 1, 2' should return an ErrQueryArgLength")
+	}
+
+	if err != ErrQueryArgLength {
+		t.Fatalf("'INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)`, 1, 2' should return an ErrQueryArgLength, but returned: %s", err)
+	}
+}
+
 // TestCreateSessionTimeout tests to make sure the CreateSession function timeouts out correctly
 // and prevents an infinite loop of connection retries.
 func TestCreateSessionTimeout(t *testing.T) {
@@ -323,43 +339,6 @@ func TestCreateSessionTimeout(t *testing.T) {
 	if err != ErrNoConnectionsStarted {
 		t.Fatalf("expected ErrNoConnectionsStarted, but received %v", err)
 	}
-}
-
-type Page struct {
-	Title       string
-	RevId       UUID
-	Body        string
-	Views       int64
-	Protected   bool
-	Modified    time.Time
-	Rating      *inf.Dec
-	Tags        []string
-	Attachments map[string]Attachment
-}
-
-type Attachment []byte
-
-var rating, _ = inf.NewDec(0, 0).SetString("0.131")
-
-var pageTestData = []*Page{
-	&Page{
-		Title:    "Frontpage",
-		RevId:    TimeUUID(),
-		Body:     "Welcome to this wiki page!",
-		Rating:   rating,
-		Modified: time.Date(2013, time.August, 13, 9, 52, 3, 0, time.UTC),
-		Tags:     []string{"start", "important", "test"},
-		Attachments: map[string]Attachment{
-			"logo":    Attachment("\x00company logo\x00"),
-			"favicon": Attachment("favicon.ico"),
-		},
-	},
-	&Page{
-		Title:    "Foobar",
-		RevId:    TimeUUID(),
-		Body:     "foo::Foo f = new foo::Foo(foo::Foo::INIT);",
-		Modified: time.Date(2013, time.August, 13, 9, 52, 3, 0, time.UTC),
-	},
 }
 
 func TestSliceMap(t *testing.T) {
@@ -573,6 +552,167 @@ func TestScanCASWithNilArguments(t *testing.T) {
 	}
 }
 
+//TestStaticQueryInfo makes sure that the application can manually bind query parameters using the simplest possible static binding strategy
+func TestStaticQueryInfo(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+
+	if err := session.Query("CREATE TABLE static_query_info (id int, value text, PRIMARY KEY (id))").Exec(); err != nil {
+		t.Fatalf("failed to create table with error '%v'", err)
+	}
+
+	if err := session.Query("INSERT INTO static_query_info (id, value) VALUES (?, ?)", 113, "foo").Exec(); err != nil {
+		t.Fatalf("insert into static_query_info failed, err '%v'", err)
+	}
+
+	autobinder := func(q *QueryInfo) ([]interface{}, error) {
+		values := make([]interface{}, 1)
+		values[0] = 113
+		return values, nil
+	}
+
+	qry := session.Bind("SELECT id, value FROM static_query_info WHERE id = ?", autobinder)
+
+	if err := qry.Exec(); err != nil {
+		t.Fatalf("expose query info failed, error '%v'", err)
+	}
+
+	iter := qry.Iter()
+
+	var id int
+	var value string
+
+	iter.Scan(&id, &value)
+
+	if err := iter.Close(); err != nil {
+		t.Fatalf("query with exposed info failed, err '%v'", err)
+	}
+
+	if value != "foo" {
+		t.Fatalf("Expected value %s, but got %s", "foo", value)
+	}
+
+}
+
+type ClusteredKeyValue struct {
+	Id      int
+	Cluster int
+	Value   string
+}
+
+func (kv *ClusteredKeyValue) Bind(q *QueryInfo) ([]interface{}, error) {
+	values := make([]interface{}, len(q.Args))
+
+	for i, info := range q.Args {
+		fieldName := upcaseInitial(info.Name)
+		value := reflect.ValueOf(kv)
+		field := reflect.Indirect(value).FieldByName(fieldName)
+		values[i] = field.Addr().Interface()
+	}
+
+	return values, nil
+}
+
+func upcaseInitial(str string) string {
+	for i, v := range str {
+		return string(unicode.ToUpper(v)) + str[i+1:]
+	}
+	return ""
+}
+
+//TestBoundQueryInfo makes sure that the application can manually bind query parameters using the query meta data supplied at runtime
+func TestBoundQueryInfo(t *testing.T) {
+
+	session := createSession(t)
+	defer session.Close()
+
+	if err := session.Query("CREATE TABLE clustered_query_info (id int, cluster int, value text, PRIMARY KEY (id, cluster))").Exec(); err != nil {
+		t.Fatalf("failed to create table with error '%v'", err)
+	}
+
+	write := &ClusteredKeyValue{Id: 200, Cluster: 300, Value: "baz"}
+
+	insert := session.Bind("INSERT INTO clustered_query_info (id, cluster, value) VALUES (?, ?,?)", write.Bind)
+
+	if err := insert.Exec(); err != nil {
+		t.Fatalf("insert into clustered_query_info failed, err '%v'", err)
+	}
+
+	read := &ClusteredKeyValue{Id: 200, Cluster: 300}
+
+	qry := session.Bind("SELECT id, cluster, value FROM clustered_query_info WHERE id = ? and cluster = ?", read.Bind)
+
+	iter := qry.Iter()
+
+	var id, cluster int
+	var value string
+
+	iter.Scan(&id, &cluster, &value)
+
+	if err := iter.Close(); err != nil {
+		t.Fatalf("query with clustered_query_info info failed, err '%v'", err)
+	}
+
+	if value != "baz" {
+		t.Fatalf("Expected value %s, but got %s", "baz", value)
+	}
+
+}
+
+//TestBatchQueryInfo makes sure that the application can manually bind query parameters when executing in a batch
+func TestBatchQueryInfo(t *testing.T) {
+
+	if *flagProto == 1 {
+		t.Skip("atomic batches not supported. Please use Cassandra >= 2.0")
+	}
+
+	session := createSession(t)
+	defer session.Close()
+
+	if err := session.Query("CREATE TABLE batch_query_info (id int, cluster int, value text, PRIMARY KEY (id, cluster))").Exec(); err != nil {
+		t.Fatalf("failed to create table with error '%v'", err)
+	}
+
+	write := func(q *QueryInfo) ([]interface{}, error) {
+		values := make([]interface{}, 3)
+		values[0] = 4000
+		values[1] = 5000
+		values[2] = "bar"
+		return values, nil
+	}
+
+	batch := session.NewBatch(LoggedBatch)
+	batch.Bind("INSERT INTO batch_query_info (id, cluster, value) VALUES (?, ?,?)", write)
+
+	if err := session.ExecuteBatch(batch); err != nil {
+		t.Fatalf("batch insert into batch_query_info failed, err '%v'", err)
+	}
+
+	read := func(q *QueryInfo) ([]interface{}, error) {
+		values := make([]interface{}, 2)
+		values[0] = 4000
+		values[1] = 5000
+		return values, nil
+	}
+
+	qry := session.Bind("SELECT id, cluster, value FROM batch_query_info WHERE id = ? and cluster = ?", read)
+
+	iter := qry.Iter()
+
+	var id, cluster int
+	var value string
+
+	iter.Scan(&id, &cluster, &value)
+
+	if err := iter.Close(); err != nil {
+		t.Fatalf("query with batch_query_info info failed, err '%v'", err)
+	}
+
+	if value != "bar" {
+		t.Fatalf("Expected value %s, but got %s", "bar", value)
+	}
+}
+
 func injectInvalidPreparedStatement(t *testing.T, session *Session, table string) (string, *Conn) {
 	if err := session.Query(`CREATE TABLE ` + table + ` (
 			foo   varchar,
@@ -583,28 +723,21 @@ func injectInvalidPreparedStatement(t *testing.T, session *Session, table string
 	}
 	stmt := "INSERT INTO " + table + " (foo, bar) VALUES (?, 7)"
 	conn := session.Pool.Pick(nil)
-	conn.prepMu.Lock()
 	flight := new(inflightPrepare)
-	conn.prep[stmt] = flight
-	flight.info = &queryInfo{
-		id: []byte{'f', 'o', 'o', 'b', 'a', 'r'},
-		args: []ColumnInfo{ColumnInfo{
+	stmtsLRU.mu.Lock()
+	stmtsLRU.lru.Add(conn.addr+stmt, flight)
+	stmtsLRU.mu.Unlock()
+	flight.info = &QueryInfo{
+		Id: []byte{'f', 'o', 'o', 'b', 'a', 'r'},
+		Args: []ColumnInfo{ColumnInfo{
 			Keyspace: "gocql_test",
 			Table:    table,
 			Name:     "foo",
 			TypeInfo: &TypeInfo{
 				Type: TypeVarchar,
 			},
-		}, ColumnInfo{
-			Keyspace: "gocql_test",
-			Table:    table,
-			Name:     "bar",
-			TypeInfo: &TypeInfo{
-				Type: TypeInt,
-			},
 		}},
 	}
-	conn.prepMu.Unlock()
 	return stmt, conn
 }
 
@@ -619,6 +752,9 @@ func TestReprepareStatement(t *testing.T) {
 }
 
 func TestReprepareBatch(t *testing.T) {
+	if *flagProto == 1 {
+		t.Skip("atomic batches not supported. Please use Cassandra >= 2.0")
+	}
 	session := createSession(t)
 	defer session.Close()
 	stmt, conn := injectInvalidPreparedStatement(t, session, "test_reprepare_statement_batch")
@@ -628,4 +764,111 @@ func TestReprepareBatch(t *testing.T) {
 		t.Fatalf("Failed to execute query for reprepare statement: %v", err)
 	}
 
+}
+
+func TestQueryInfo(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+
+	conn := session.Pool.Pick(nil)
+	info, err := conn.prepareStatement("SELECT release_version, host_id FROM system.local WHERE key = ?", nil)
+
+	if err != nil {
+		t.Fatalf("Failed to execute query for preparing statement: %v", err)
+	}
+
+	if len(info.Args) != 1 {
+		t.Fatalf("Was not expecting meta data for %d query arguments, but got %d\n", 1, len(info.Args))
+	}
+
+	if *flagProto > 1 {
+		if len(info.Rval) != 2 {
+			t.Fatalf("Was not expecting meta data for %d result columns, but got %d\n", 2, len(info.Rval))
+		}
+	}
+}
+
+//TestPreparedCacheEviction will make sure that the cache size is maintained
+func TestPreparedCacheEviction(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+	stmtsLRU.mu.Lock()
+	stmtsLRU.Max(4)
+	stmtsLRU.mu.Unlock()
+
+	if err := session.Query("CREATE TABLE prepcachetest (id int,mod int,PRIMARY KEY (id))").Exec(); err != nil {
+		t.Fatalf("failed to create table with error '%v'", err)
+	}
+	//Fill the table
+	for i := 0; i < 2; i++ {
+		if err := session.Query("INSERT INTO prepcachetest (id,mod) VALUES (?, ?)", i, 10000%(i+1)).Exec(); err != nil {
+			t.Fatalf("insert into prepcachetest failed, err '%v'", err)
+		}
+	}
+	//Populate the prepared statement cache with select statements
+	var id, mod int
+	for i := 0; i < 2; i++ {
+		err := session.Query("SELECT id,mod FROM prepcachetest WHERE id = "+strconv.FormatInt(int64(i), 10)).Scan(&id, &mod)
+		if err != nil {
+			t.Fatalf("select from prepcachetest failed, error '%v'", err)
+		}
+	}
+
+	//generate an update statement to test they are prepared
+	err := session.Query("UPDATE prepcachetest SET mod = ? WHERE id = ?", 1, 11).Exec()
+	if err != nil {
+		t.Fatalf("update prepcachetest failed, error '%v'", err)
+	}
+
+	//generate a delete statement to test they are prepared
+	err = session.Query("DELETE FROM prepcachetest WHERE id = ?", 1).Exec()
+	if err != nil {
+		t.Fatalf("delete from prepcachetest failed, error '%v'", err)
+	}
+
+	//generate an insert statement to test they are prepared
+	err = session.Query("INSERT INTO prepcachetest (id,mod) VALUES (?, ?)", 3, 11).Exec()
+	if err != nil {
+		t.Fatalf("insert into prepcachetest failed, error '%v'", err)
+	}
+
+	//Make sure the cache size is maintained
+	if stmtsLRU.lru.Len() != stmtsLRU.lru.MaxEntries {
+		t.Fatalf("expected cache size of %v, got %v", stmtsLRU.lru.MaxEntries, stmtsLRU.lru.Len())
+	}
+
+	//Walk through all the configured hosts and test cache retention and eviction
+	var selFound, insFound, updFound, delFound, selEvict bool
+	for i := range session.cfg.Hosts {
+		_, ok := stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042SELECT id,mod FROM prepcachetest WHERE id = 1")
+		selFound = selFound || ok
+
+		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042INSERT INTO prepcachetest (id,mod) VALUES (?, ?)")
+		insFound = insFound || ok
+
+		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042UPDATE prepcachetest SET mod = ? WHERE id = ?")
+		updFound = updFound || ok
+
+		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042DELETE FROM prepcachetest WHERE id = ?")
+		delFound = delFound || ok
+
+		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042SELECT id,mod FROM prepcachetest WHERE id = 0")
+		selEvict = selEvict || !ok
+
+	}
+	if !selEvict {
+		t.Fatalf("expected first select statement to be purged, but statement was found in the cache.")
+	}
+	if !selFound {
+		t.Fatalf("expected second select statement to be cached, but statement was purged or not prepared.")
+	}
+	if !insFound {
+		t.Fatalf("expected insert statement to be cached, but statement was purged or not prepared.")
+	}
+	if !updFound {
+		t.Fatalf("expected update statement to be cached, but statement was purged or not prepared.")
+	}
+	if !delFound {
+		t.Error("expected delete statement to be cached, but statement was purged or not prepared.")
+	}
 }

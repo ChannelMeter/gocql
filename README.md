@@ -13,6 +13,8 @@ Project Website: http://gocql.github.io/<br>
 API documentation: http://godoc.org/github.com/gocql/gocql<br>
 Discussions: https://groups.google.com/forum/#!forum/gocql
 
+Supported Versions: Cassandra 1.2, 2.0, 2.1; Go 1.2, 1.3
+
 Installation
 ------------
 
@@ -22,7 +24,7 @@ Installation
 Features
 --------
 
-* Modern Cassandra client for Cassandra 1.2 and 2.0
+* Modern Cassandra client using the native transport
 * Automatic type conversations between Cassandra and Go
   * Support for all common types including sets, lists and maps
   * Custom types can implement a `Marshaler` and `Unmarshaler` interface
@@ -34,6 +36,7 @@ Features
   * Round robin distribution of queries to different hosts
   * Round robin distribution of queries to different connections on a host
   * Each connection can execute up to 128 concurrent queries
+  * Optional automatic discovery of nodes
 * Iteration over paged results with configurable page size
 * Optional frame compression (using snappy)
 * Automatic query preparation
