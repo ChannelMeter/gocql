@@ -240,3 +240,32 @@ func (u *UUID) UnmarshalJSON(data []byte) error {
 
 	return err
 }
+
+// gogoprotobuf Marshal
+func (uuid UUID) Marshal() ([]byte, error) {
+	if len(uuid) == 0 {
+		return nil, nil
+	}
+	return uuid[:], nil
+}
+
+// gogoprotobuf MarshalTo
+func (uuid UUID) MarshalTo(data []byte) (n int, err error) {
+	copy(data, uuid[:])
+	return 16, nil
+}
+
+// gogoprotobuf Unmarshal
+func (uuid *UUID) Unmarshal(data []byte) error {
+	var id UUID
+	if len(data) != 0 {
+		copy(id[:], data)
+	}
+	*uuid = id
+	return nil
+}
+
+// gogoprotobuf Size
+func (uuid *UUID) Size() int {
+	return 16
+}
