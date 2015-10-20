@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gocql/gocql/lru"
+	"github.com/channelmeter/gocql/lru"
 )
 
 const defaultMaxPreparedStmts = 1000
