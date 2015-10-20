@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/golang/groupcache/lru"
+	"github.com/gocql/gocql/lru"
 )
 
 // Session is the interface used by users to interact with the database.
@@ -28,7 +28,7 @@ import (
 // and automatically sets a default consinstency level on all operations
 // that do not have a consistency level set.
 type Session struct {
-	Pool                ConnectionPool
+	pool                *policyConnPool
 	cons                Consistency
 	pageSize            int
 	prefetch            float64
@@ -37,6 +37,8 @@ type Session struct {
 	trace               Tracer
 	hostSource          *ringDescriber
 	mu                  sync.RWMutex
+
+	control *controlConn
 
 	cfg ClusterConfig
 
@@ -60,47 +62,48 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		cfg.NumStreams = maxStreams
 	}
 
-	pool, err := cfg.ConnPoolType(&cfg)
-	if err != nil {
-		return nil, err
-	}
-
 	//Adjust the size of the prepared statements cache to match the latest configuration
 	stmtsLRU.Lock()
 	initStmtsLRU(cfg.MaxPreparedStmts)
 	stmtsLRU.Unlock()
 
 	s := &Session{
-		Pool:     pool,
 		cons:     cfg.Consistency,
 		prefetch: 0.25,
 		cfg:      cfg,
+		pageSize: cfg.PageSize,
 	}
+
+	pool, err := cfg.PoolConfig.buildPool(&s.cfg)
+	if err != nil {
+		return nil, err
+	}
+	s.pool = pool
 
 	//See if there are any connections in the pool
-	if pool.Size() > 0 {
-		s.routingKeyInfoCache.lru = lru.New(cfg.MaxRoutingKeyInfo)
-
-		s.SetConsistency(cfg.Consistency)
-		s.SetPageSize(cfg.PageSize)
-
-		if cfg.DiscoverHosts {
-			s.hostSource = &ringDescriber{
-				session:    s,
-				dcFilter:   cfg.Discovery.DcFilter,
-				rackFilter: cfg.Discovery.RackFilter,
-				closeChan:  make(chan bool),
-			}
-
-			go s.hostSource.run(cfg.Discovery.Sleep)
-		}
-
-		return s, nil
+	if pool.Size() == 0 {
+		s.Close()
+		return nil, ErrNoConnectionsStarted
 	}
 
-	s.Close()
+	s.routingKeyInfoCache.lru = lru.New(cfg.MaxRoutingKeyInfo)
 
-	return nil, ErrNoConnectionsStarted
+	if !cfg.disableControlConn {
+		s.control = createControlConn(s)
+	}
+
+	if cfg.DiscoverHosts {
+		s.hostSource = &ringDescriber{
+			session:    s,
+			dcFilter:   cfg.Discovery.DcFilter,
+			rackFilter: cfg.Discovery.RackFilter,
+			closeChan:  make(chan bool),
+		}
+
+		go s.hostSource.run(cfg.Discovery.Sleep)
+	}
+
+	return s, nil
 }
 
 // SetConsistency sets the default consistency level for this session. This
@@ -154,9 +157,10 @@ func (s *Session) Query(stmt string, values ...interface{}) *Query {
 }
 
 type QueryInfo struct {
-	Id   []byte
-	Args []ColumnInfo
-	Rval []ColumnInfo
+	Id          []byte
+	Args        []ColumnInfo
+	Rval        []ColumnInfo
+	PKeyColumns []int
 }
 
 // Bind generates a new query object based on the query statement passed in.
@@ -185,10 +189,14 @@ func (s *Session) Close() {
 	}
 	s.isClosed = true
 
-	s.Pool.Close()
+	s.pool.Close()
 
 	if s.hostSource != nil {
 		close(s.hostSource.closeChan)
+	}
+
+	if s.control != nil {
+		s.control.close()
 	}
 }
 
@@ -210,12 +218,16 @@ func (s *Session) executeQuery(qry *Query) *Iter {
 	qry.attempts = 0
 	qry.totalLatency = 0
 	for {
-		conn := s.Pool.Pick(qry)
+		conn := s.pool.Pick(qry)
 
 		//Assign the error unavailable to the iterator
 		if conn == nil {
-			iter = &Iter{err: ErrNoConnections}
-			break
+			if qry.rt == nil || !qry.rt.Attempt(qry) {
+				iter = &Iter{err: ErrNoConnections}
+				break
+			}
+
+			continue
 		}
 
 		t := time.Now()
@@ -260,9 +272,8 @@ func (s *Session) KeyspaceMetadata(keyspace string) (*KeyspaceMetadata, error) {
 // returns routing key indexes and type info
 func (s *Session) routingKeyInfo(stmt string) (*routingKeyInfo, error) {
 	s.routingKeyInfoCache.mu.Lock()
-	cacheKey := s.cfg.Keyspace + stmt
 
-	entry, cached := s.routingKeyInfoCache.lru.Get(cacheKey)
+	entry, cached := s.routingKeyInfoCache.lru.Get(stmt)
 	if cached {
 		// done accessing the cache
 		s.routingKeyInfoCache.mu.Unlock()
@@ -286,44 +297,44 @@ func (s *Session) routingKeyInfo(stmt string) (*routingKeyInfo, error) {
 	inflight := new(inflightCachedEntry)
 	inflight.wg.Add(1)
 	defer inflight.wg.Done()
-	s.routingKeyInfoCache.lru.Add(cacheKey, inflight)
+	s.routingKeyInfoCache.lru.Add(stmt, inflight)
 	s.routingKeyInfoCache.mu.Unlock()
 
 	var (
-		prepared     *resultPreparedFrame
+		info         *QueryInfo
 		partitionKey []*ColumnMetadata
 	)
 
 	// get the query info for the statement
-	conn := s.Pool.Pick(nil)
+	conn := s.pool.Pick(nil)
 	if conn == nil {
 		// no connections
 		inflight.err = ErrNoConnections
 		// don't cache this error
-		s.routingKeyInfoCache.Remove(cacheKey)
+		s.routingKeyInfoCache.Remove(stmt)
 		return nil, inflight.err
 	}
 
-	prepared, inflight.err = conn.prepareStatement(stmt, nil)
+	info, inflight.err = conn.prepareStatement(stmt, nil)
 	if inflight.err != nil {
 		// don't cache this error
-		s.routingKeyInfoCache.Remove(cacheKey)
+		s.routingKeyInfoCache.Remove(stmt)
 		return nil, inflight.err
 	}
 
-	if len(prepared.reqMeta.columns) == 0 {
+	if len(info.Args) == 0 {
 		// no arguments, no routing key, and no error
 		return nil, nil
 	}
 
 	// get the table metadata
-	table := prepared.reqMeta.columns[0].Table
+	table := info.Args[0].Table
 
 	var keyspaceMetadata *KeyspaceMetadata
 	keyspaceMetadata, inflight.err = s.KeyspaceMetadata(s.cfg.Keyspace)
 	if inflight.err != nil {
 		// don't cache this error
-		s.routingKeyInfoCache.Remove(cacheKey)
+		s.routingKeyInfoCache.Remove(stmt)
 		return nil, inflight.err
 	}
 
@@ -334,7 +345,7 @@ func (s *Session) routingKeyInfo(stmt string) (*routingKeyInfo, error) {
 		// in the metadata code, or that the table was just dropped.
 		inflight.err = ErrNoMetadata
 		// don't cache this error
-		s.routingKeyInfoCache.Remove(cacheKey)
+		s.routingKeyInfoCache.Remove(stmt)
 		return nil, inflight.err
 	}
 
@@ -350,7 +361,7 @@ func (s *Session) routingKeyInfo(stmt string) (*routingKeyInfo, error) {
 		routingKeyInfo.indexes[keyIndex] = -1
 
 		// find the column in the query info
-		for argIndex, boundColumn := range prepared.reqMeta.columns {
+		for argIndex, boundColumn := range info.Args {
 			if keyColumn.Name == boundColumn.Name {
 				// there may be many such bound columns, pick the first
 				routingKeyInfo.indexes[keyIndex] = argIndex
@@ -390,7 +401,7 @@ func (s *Session) executeBatch(batch *Batch) (*Iter, error) {
 	batch.attempts = 0
 	batch.totalLatency = 0
 	for {
-		conn := s.Pool.Pick(nil)
+		conn := s.pool.Pick(nil)
 
 		//Assign the error unavailable and break loop
 		if conn == nil {
@@ -471,6 +482,7 @@ type Query struct {
 	cons             Consistency
 	pageSize         int
 	routingKey       []byte
+	routingKeyBuffer []byte
 	pageState        []byte
 	prefetch         float64
 	trace            Tracer
@@ -481,6 +493,13 @@ type Query struct {
 	totalLatency     int64
 	serialCons       SerialConsistency
 	defaultTimestamp bool
+
+	disableAutoPage bool
+}
+
+// String implements the stringer interface.
+func (q Query) String() string {
+	return fmt.Sprintf("[query statement=%q values=%+v consistency=%s]", q.stmt, q.values, q.cons)
 }
 
 //Attempts returns the number of times the query was executed.
@@ -560,6 +579,7 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if routingKeyInfo == nil {
 		return nil, nil
 	}
@@ -576,8 +596,14 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 		return routingKey, nil
 	}
 
+	// We allocate that buffer only once, so that further re-bind/exec of the
+	// same query don't allocate more memory.
+	if q.routingKeyBuffer == nil {
+		q.routingKeyBuffer = make([]byte, 0, 256)
+	}
+
 	// composite routing key
-	buf := &bytes.Buffer{}
+	buf := bytes.NewBuffer(q.routingKeyBuffer)
 	for i := range routingKeyInfo.indexes {
 		encoded, err := Marshal(
 			routingKeyInfo.types[i],
@@ -586,7 +612,9 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		binary.Write(buf, binary.BigEndian, int16(len(encoded)))
+		lenBuf := []byte{0x00, 0x00}
+		binary.BigEndian.PutUint16(lenBuf, uint16(len(encoded)))
+		buf.Write(lenBuf)
 		buf.Write(encoded)
 		buf.WriteByte(0x00)
 	}
@@ -647,16 +675,33 @@ func (q *Query) SerialConsistency(cons SerialConsistency) *Query {
 	return q
 }
 
+// PageState sets the paging state for the query to resume paging from a specific
+// point in time. Setting this will disable to query paging for this query, and
+// must be used for all subsequent pages.
+func (q *Query) PageState(state []byte) *Query {
+	q.pageState = state
+	q.disableAutoPage = true
+	return q
+}
+
 // Exec executes the query without returning any rows.
 func (q *Query) Exec() error {
 	iter := q.Iter()
 	return iter.err
 }
 
+func isUseStatement(stmt string) bool {
+	if len(stmt) < 3 {
+		return false
+	}
+
+	return strings.ToLower(stmt[0:3]) == "use"
+}
+
 // Iter executes the query and returns an iterator capable of iterating
 // over all results.
 func (q *Query) Iter() *Iter {
-	if strings.Index(strings.ToLower(q.stmt), "use") == 0 {
+	if isUseStatement(q.stmt) {
 		return &Iter{err: ErrUseStmt}
 	}
 	return q.session.executeQuery(q)
@@ -733,6 +778,9 @@ type Iter struct {
 	rows [][][]byte
 	meta resultMetadata
 	next *nextIter
+
+	framer *framer
+	once   sync.Once
 }
 
 // Columns returns the name and type of the selected columns.
@@ -806,6 +854,13 @@ func (iter *Iter) Scan(dest ...interface{}) bool {
 // Close closes the iterator and returns any errors that happened during
 // the query or the iteration.
 func (iter *Iter) Close() error {
+	iter.once.Do(func() {
+		if iter.framer != nil {
+			framerPool.Put(iter.framer)
+			iter.framer = nil
+		}
+	})
+
 	return iter.err
 }
 
@@ -817,6 +872,12 @@ func (iter *Iter) checkErrAndNotFound() error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// PageState return the current paging state for a query which can be used for
+// subsequent quries to resume paging this point.
+func (iter *Iter) PageState() []byte {
+	return iter.meta.pagingState
 }
 
 type nextIter struct {
@@ -927,8 +988,8 @@ type BatchType byte
 
 const (
 	LoggedBatch   BatchType = 0
-	UnloggedBatch           = 1
-	CounterBatch            = 2
+	UnloggedBatch BatchType = 1
+	CounterBatch  BatchType = 2
 )
 
 type BatchEntry struct {
@@ -1008,29 +1069,40 @@ func (t *traceWriter) Trace(traceId []byte) {
 		coordinator string
 		duration    int
 	)
-	t.session.Query(`SELECT coordinator, duration
+	iter := t.session.control.query(`SELECT coordinator, duration
 			FROM system_traces.sessions
-			WHERE session_id = ?`, traceId).
-		Consistency(One).Scan(&coordinator, &duration)
+			WHERE session_id = ?`, traceId)
 
-	iter := t.session.Query(`SELECT event_id, activity, source, source_elapsed
-			FROM system_traces.events
-			WHERE session_id = ?`, traceId).
-		Consistency(One).Iter()
+	iter.Scan(&coordinator, &duration)
+	if err := iter.Close(); err != nil {
+		t.mu.Lock()
+		fmt.Fprintln(t.w, "Error:", err)
+		t.mu.Unlock()
+		return
+	}
+
 	var (
 		timestamp time.Time
 		activity  string
 		source    string
 		elapsed   int
 	)
-	t.mu.Lock()
-	defer t.mu.Unlock()
+
 	fmt.Fprintf(t.w, "Tracing session %016x (coordinator: %s, duration: %v):\n",
 		traceId, coordinator, time.Duration(duration)*time.Microsecond)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	iter = t.session.control.query(`SELECT event_id, activity, source, source_elapsed
+			FROM system_traces.events
+			WHERE session_id = ?`, traceId)
+
 	for iter.Scan(&timestamp, &activity, &source, &elapsed) {
 		fmt.Fprintf(t.w, "%s: %s (source: %s, elapsed: %d)\n",
 			timestamp.Format("2006/01/02 15:04:05.999999"), activity, source, elapsed)
 	}
+
 	if err := iter.Close(); err != nil {
 		fmt.Fprintln(t.w, "Error:", err)
 	}

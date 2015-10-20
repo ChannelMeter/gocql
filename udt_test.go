@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 type position struct {
@@ -50,7 +51,7 @@ func TestUDT_Marshaler(t *testing.T) {
 	session := createSession(t)
 	defer session.Close()
 
-	err := createTable(session, `CREATE TYPE position(
+	err := createTable(session, `CREATE TYPE gocql_test.position(
 		lat int,
 		lon int,
 		padding text);`)
@@ -58,7 +59,7 @@ func TestUDT_Marshaler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = createTable(session, `CREATE TABLE houses(
+	err = createTable(session, `CREATE TABLE gocql_test.houses(
 		id int,
 		name text,
 		loc frozen<position>,
@@ -107,14 +108,14 @@ func TestUDT_Reflect(t *testing.T) {
 	session := createSession(t)
 	defer session.Close()
 
-	err := createTable(session, `CREATE TYPE horse(
+	err := createTable(session, `CREATE TYPE gocql_test.horse(
 		name text,
 		owner text);`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = createTable(session, `CREATE TABLE horse_race(
+	err = createTable(session, `CREATE TABLE gocql_test.horse_race(
 		position int,
 		horse frozen<horse>,
 
@@ -166,14 +167,14 @@ func TestUDT_Proto2error(t *testing.T) {
 	}
 	defer session.Close()
 
-	err = createTable(session, `CREATE TYPE fish(
+	err = createTable(session, `CREATE TYPE gocql_test.fish(
 		name text,
 		owner text);`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = createTable(session, `CREATE TABLE fish_race(
+	err = createTable(session, `CREATE TABLE gocql_test.fish_race(
 		position int,
 		fish frozen<fish>,
 
@@ -207,14 +208,14 @@ func TestUDT_NullObject(t *testing.T) {
 	session := createSession(t)
 	defer session.Close()
 
-	err := createTable(session, `CREATE TYPE udt_null_type(
+	err := createTable(session, `CREATE TYPE gocql_test.udt_null_type(
 		name text,
 		owner text);`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = createTable(session, `CREATE TABLE udt_null_table(
+	err = createTable(session, `CREATE TABLE gocql_test.udt_null_table(
 		id uuid,
 		udt_col frozen<udt_null_type>,
 
@@ -251,4 +252,92 @@ func TestUDT_NullObject(t *testing.T) {
 	if readCol.Owner != "" {
 		t.Errorf("expected empty string to be returned for null udt: got %q", readCol.Owner)
 	}
+}
+
+func TestMapScanUDT(t *testing.T) {
+	if *flagProto < protoVersion3 {
+		t.Skip("UDT are only available on protocol >= 3")
+	}
+
+	session := createSession(t)
+	defer session.Close()
+
+	err := createTable(session, `CREATE TYPE gocql_test.log_entry (
+		created_timestamp timestamp,
+		message text
+	);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = createTable(session, `CREATE TABLE gocql_test.requests_by_id (
+		id uuid PRIMARY KEY,
+		type int,
+		log_entries list<frozen <log_entry>>
+	);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entry := []struct {
+		CreatedTimestamp time.Time `cql:"created_timestamp"`
+		Message          string    `cql:"message"`
+	}{
+		{
+			CreatedTimestamp: time.Now().Truncate(time.Millisecond),
+			Message:          "test time now",
+		},
+	}
+
+	id, _ := RandomUUID()
+	const typ = 1
+
+	err = session.Query("INSERT INTO requests_by_id(id, type, log_entries) VALUES (?, ?, ?)", id, typ, entry).Exec()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rawResult := map[string]interface{}{}
+	err = session.Query(`SELECT * FROM requests_by_id WHERE id = ?`, id).MapScan(rawResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logEntries, ok := rawResult["log_entries"].([]map[string]interface{})
+	if !ok {
+		t.Fatal("log_entries not in scanned map")
+	}
+
+	if len(logEntries) != 1 {
+		t.Fatalf("expected to get 1 log_entry got %d", len(logEntries))
+	}
+
+	logEntry := logEntries[0]
+
+	timestamp, ok := logEntry["created_timestamp"]
+	if !ok {
+		t.Error("created_timestamp not unmarshalled into map")
+	} else {
+		if ts, ok := timestamp.(time.Time); ok {
+			if !ts.In(time.UTC).Equal(entry[0].CreatedTimestamp.In(time.UTC)) {
+				t.Errorf("created_timestamp not equal to stored: got %v expected %v", ts.In(time.UTC), entry[0].CreatedTimestamp.In(time.UTC))
+			}
+		} else {
+			t.Errorf("created_timestamp was not time.Time got: %T", timestamp)
+		}
+	}
+
+	message, ok := logEntry["message"]
+	if !ok {
+		t.Error("message not unmarshalled into map")
+	} else {
+		if ts, ok := message.(string); ok {
+			if ts != message {
+				t.Errorf("message not equal to stored: got %v expected %v", ts, entry[0].Message)
+			}
+		} else {
+			t.Errorf("message was not string got: %T", message)
+		}
+	}
+
 }

@@ -99,6 +99,7 @@ type Conn struct {
 	conn    net.Conn
 	r       *bufio.Reader
 	timeout time.Duration
+	cfg     *ConnConfig
 
 	headerBuf []byte
 
@@ -121,7 +122,7 @@ type Conn struct {
 
 // Connect establishes a connection to a Cassandra node.
 // You must also call the Serve method before you can execute any queries.
-func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn, error) {
+func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler) (*Conn, error) {
 	var (
 		err  error
 		conn net.Conn
@@ -144,7 +145,7 @@ func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn,
 	}
 
 	// going to default to proto 2
-	if cfg.ProtoVersion < protoVersion1 || cfg.ProtoVersion > protoVersion3 {
+	if cfg.ProtoVersion < protoVersion1 || cfg.ProtoVersion > protoVersion4 {
 		log.Printf("unsupported protocol version: %d using 2\n", cfg.ProtoVersion)
 		cfg.ProtoVersion = 2
 	}
@@ -166,6 +167,7 @@ func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn,
 	c := &Conn{
 		conn:         conn,
 		r:            bufio.NewReader(conn),
+		cfg:          cfg,
 		uniq:         make(chan int, cfg.NumStreams),
 		calls:        make([]callReq, cfg.NumStreams),
 		timeout:      cfg.Timeout,
@@ -191,7 +193,7 @@ func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn,
 
 	go c.serve()
 
-	if err := c.startup(&cfg); err != nil {
+	if err := c.startup(); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -231,16 +233,21 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	return
 }
 
-func (c *Conn) startup(cfg *ConnConfig) error {
+func (c *Conn) startup() error {
 	m := map[string]string{
-		"CQL_VERSION": cfg.CQLVersion,
+		"CQL_VERSION": c.cfg.CQLVersion,
 	}
 
 	if c.compressor != nil {
 		m["COMPRESSION"] = c.compressor.Name()
 	}
 
-	frame, err := c.exec(&writeStartupFrame{opts: m}, nil)
+	framer, err := c.exec(&writeStartupFrame{opts: m}, nil)
+	if err != nil {
+		return err
+	}
+
+	frame, err := framer.parseFrame()
 	if err != nil {
 		return err
 	}
@@ -270,7 +277,12 @@ func (c *Conn) authenticateHandshake(authFrame *authenticateFrame) error {
 	req := &writeAuthResponseFrame{data: resp}
 
 	for {
-		frame, err := c.exec(req, nil)
+		framer, err := c.exec(req, nil)
+		if err != nil {
+			return err
+		}
+
+		frame, err := framer.parseFrame()
 		if err != nil {
 			return err
 		}
@@ -295,6 +307,8 @@ func (c *Conn) authenticateHandshake(authFrame *authenticateFrame) error {
 		default:
 			return fmt.Errorf("unknown frame response during authentication: %v", v)
 		}
+
+		framerPool.Put(framer)
 	}
 }
 
@@ -350,6 +364,14 @@ func (c *Conn) serve() {
 	c.closeWithError(err)
 }
 
+func (c *Conn) discardFrame(head frameHeader) error {
+	_, err := io.CopyN(ioutil.Discard, c, int64(head.length))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (c *Conn) recv() error {
 	// not safe for concurrent reads
 
@@ -369,11 +391,7 @@ func (c *Conn) recv() error {
 		return fmt.Errorf("gocql: frame header stream is beyond call exepected bounds: %d", head.stream)
 	} else if head.stream == -1 {
 		// TODO: handle cassandra event frames, we shouldnt get any currently
-		_, err := io.CopyN(ioutil.Discard, c, int64(head.length))
-		if err != nil {
-			return err
-		}
-		return nil
+		return c.discardFrame(head)
 	} else if head.stream <= 0 {
 		// reserved stream that we dont use, probably due to a protocol error
 		// or a bug in Cassandra, this should be an error, parse it and return.
@@ -381,6 +399,7 @@ func (c *Conn) recv() error {
 		if err := framer.readFrame(&head); err != nil {
 			return err
 		}
+		defer framerPool.Put(framer)
 
 		frame, err := framer.parseFrame()
 		if err != nil {
@@ -396,6 +415,11 @@ func (c *Conn) recv() error {
 	}
 
 	call := &c.calls[head.stream]
+	if call == nil || call.framer == nil {
+		log.Printf("gocql: received response for stream which has no handler: header=%v\n", head)
+		return c.discardFrame(head)
+	}
+
 	err = call.framer.readFrame(&head)
 	if err != nil {
 		// only net errors should cause the connection to be closed. Though
@@ -426,7 +450,6 @@ type callReq struct {
 
 func (c *Conn) releaseStream(stream int) {
 	call := &c.calls[stream]
-	framerPool.Put(call.framer)
 	call.framer = nil
 
 	select {
@@ -441,7 +464,7 @@ func (c *Conn) handleTimeout() {
 	}
 }
 
-func (c *Conn) exec(req frameWriter, tracer Tracer) (frame, error) {
+func (c *Conn) exec(req frameWriter, tracer Tracer) (*framer, error) {
 	// TODO: move tracer onto conn
 	var stream int
 	select {
@@ -462,12 +485,25 @@ func (c *Conn) exec(req frameWriter, tracer Tracer) (frame, error) {
 
 	err := req.writeFrame(framer, stream)
 	if err != nil {
+		// I think this is the correct thing to do, im not entirely sure. It is not
+		// ideal as readers might still get some data, but they probably wont.
+		// Here we need to be careful as the stream is not available and if all
+		// writes just timeout or fail then the pool might use this connection to
+		// send a frame on, with all the streams used up and not returned.
+		c.closeWithError(err)
 		return nil, err
 	}
 
 	select {
 	case err := <-call.resp:
 		if err != nil {
+			if !c.Closed() {
+				// if the connection is closed then we cant release the stream,
+				// this is because the request is still outstanding and we have
+				// been handed another error from another stream which caused the
+				// connection to close.
+				c.releaseStream(stream)
+			}
 			return nil, err
 		}
 	case <-time.After(c.timeout):
@@ -490,19 +526,10 @@ func (c *Conn) exec(req frameWriter, tracer Tracer) (frame, error) {
 		return nil, NewErrProtocol("unexpected protocol version in response: got %d expected %d", v, c.version)
 	}
 
-	frame, err := framer.parseFrame()
-	if err != nil {
-		return nil, err
-	}
-
-	if len(framer.traceID) > 0 {
-		tracer.Trace(framer.traceID)
-	}
-
-	return frame, nil
+	return framer, nil
 }
 
-func (c *Conn) prepareStatement(stmt string, trace Tracer) (*resultPreparedFrame, error) {
+func (c *Conn) prepareStatement(stmt string, tracer Tracer) (*QueryInfo, error) {
 	stmtsLRU.Lock()
 	if stmtsLRU.lru == nil {
 		initStmtsLRU(defaultMaxPreparedStmts)
@@ -514,7 +541,7 @@ func (c *Conn) prepareStatement(stmt string, trace Tracer) (*resultPreparedFrame
 		stmtsLRU.Unlock()
 		flight := val.(*inflightPrepare)
 		flight.wg.Wait()
-		return flight.info, flight.err
+		return &flight.info, flight.err
 	}
 
 	flight := new(inflightPrepare)
@@ -526,16 +553,36 @@ func (c *Conn) prepareStatement(stmt string, trace Tracer) (*resultPreparedFrame
 		statement: stmt,
 	}
 
-	resp, err := c.exec(prep, trace)
+	framer, err := c.exec(prep, tracer)
 	if err != nil {
 		flight.err = err
 		flight.wg.Done()
 		return nil, err
 	}
 
-	switch x := resp.(type) {
+	frame, err := framer.parseFrame()
+	if err != nil {
+		flight.err = err
+		flight.wg.Done()
+		return nil, err
+	}
+
+	// TODO(zariel): tidy this up, simplify handling of frame parsing so its not duplicated
+	// everytime we need to parse a frame.
+	if len(framer.traceID) > 0 {
+		tracer.Trace(framer.traceID)
+	}
+
+	switch x := frame.(type) {
 	case *resultPreparedFrame:
-		flight.info = x
+		// defensivly copy as we will recycle the underlying buffer after we
+		// return.
+		flight.info.Id = copyBytes(x.preparedID)
+		// the type info's should _not_ have a reference to the framers read buffer,
+		// therefore we can just copy them directly.
+		flight.info.Args = x.reqMeta.columns
+		flight.info.PKeyColumns = x.reqMeta.pkeyColumns
+		flight.info.Rval = x.respMeta.columns
 	case error:
 		flight.err = x
 	default:
@@ -549,7 +596,9 @@ func (c *Conn) prepareStatement(stmt string, trace Tracer) (*resultPreparedFrame
 		stmtsLRU.Unlock()
 	}
 
-	return flight.info, flight.err
+	framerPool.Put(framer)
+
+	return &flight.info, flight.err
 }
 
 func (c *Conn) executeQuery(qry *Query) *Iter {
@@ -581,24 +630,19 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		if qry.binding == nil {
 			values = qry.values
 		} else {
-			binding := &QueryInfo{
-				Id:   info.preparedID,
-				Args: info.reqMeta.columns,
-				Rval: info.respMeta.columns,
-			}
-
-			values, err = qry.binding(binding)
+			values, err = qry.binding(info)
 			if err != nil {
 				return &Iter{err: err}
 			}
 		}
 
-		if len(values) != len(info.reqMeta.columns) {
+		if len(values) != len(info.Args) {
 			return &Iter{err: ErrQueryArgLength}
 		}
+
 		params.values = make([]queryValues, len(values))
 		for i := 0; i < len(values); i++ {
-			val, err := Marshal(info.reqMeta.columns[i].TypeInfo, values[i])
+			val, err := Marshal(info.Args[i].TypeInfo, values[i])
 			if err != nil {
 				return &Iter{err: err}
 			}
@@ -609,7 +653,7 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		}
 
 		frame = &writeExecuteFrame{
-			preparedID: info.preparedID,
+			preparedID: info.Id,
 			params:     params,
 		}
 	} else {
@@ -619,21 +663,31 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		}
 	}
 
-	resp, err := c.exec(frame, qry.trace)
+	framer, err := c.exec(frame, qry.trace)
 	if err != nil {
 		return &Iter{err: err}
 	}
 
+	resp, err := framer.parseFrame()
+	if err != nil {
+		return &Iter{err: err}
+	}
+
+	if len(framer.traceID) > 0 {
+		qry.trace.Trace(framer.traceID)
+	}
+
 	switch x := resp.(type) {
 	case *resultVoidFrame:
-		return &Iter{}
+		return &Iter{framer: framer}
 	case *resultRowsFrame:
 		iter := &Iter{
-			meta: x.meta,
-			rows: x.rows,
+			meta:   x.meta,
+			rows:   x.rows,
+			framer: framer,
 		}
 
-		if len(x.meta.pagingState) > 0 {
+		if len(x.meta.pagingState) > 0 && !qry.disableAutoPage {
 			iter.next = &nextIter{
 				qry: *qry,
 				pos: int((1 - qry.prefetch) * float64(len(iter.rows))),
@@ -646,8 +700,8 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		}
 
 		return iter
-	case *resultKeyspaceFrame, *resultSchemaChangeFrame:
-		return &Iter{}
+	case *resultKeyspaceFrame, *resultSchemaChangeFrame, *schemaChangeKeyspace, *schemaChangeTable:
+		return &Iter{framer: framer}
 	case *RequestErrUnprepared:
 		stmtsLRU.Lock()
 		stmtCacheKey := c.addr + c.currentKeyspace + qry.stmt
@@ -657,11 +711,14 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 			return c.executeQuery(qry)
 		}
 		stmtsLRU.Unlock()
-		return &Iter{err: x}
+		return &Iter{err: x, framer: framer}
 	case error:
-		return &Iter{err: x}
+		return &Iter{err: x, framer: framer}
 	default:
-		return &Iter{err: NewErrProtocol("Unknown type in response to execute query: %s", x)}
+		return &Iter{
+			err:    NewErrProtocol("Unknown type in response to execute query (%T): %s", x, x),
+			framer: framer,
+		}
 	}
 }
 
@@ -688,7 +745,12 @@ func (c *Conn) UseKeyspace(keyspace string) error {
 	q := &writeQueryFrame{statement: `USE "` + keyspace + `"`}
 	q.params.consistency = Any
 
-	resp, err := c.exec(q, nil)
+	framer, err := c.exec(q, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := framer.parseFrame()
 	if err != nil {
 		return err
 	}
@@ -735,28 +797,23 @@ func (c *Conn) executeBatch(batch *Batch) (*Iter, error) {
 			if entry.binding == nil {
 				args = entry.Args
 			} else {
-				binding := &QueryInfo{
-					Id:   info.preparedID,
-					Args: info.reqMeta.columns,
-					Rval: info.respMeta.columns,
-				}
-				args, err = entry.binding(binding)
+				args, err = entry.binding(info)
 				if err != nil {
 					return nil, err
 				}
 			}
 
-			if len(args) != len(info.reqMeta.columns) {
+			if len(args) != len(info.Args) {
 				return nil, ErrQueryArgLength
 			}
 
-			b.preparedID = info.preparedID
-			stmts[string(info.preparedID)] = entry.Stmt
+			b.preparedID = info.Id
+			stmts[string(info.Id)] = entry.Stmt
 
-			b.values = make([]queryValues, len(info.reqMeta.columns))
+			b.values = make([]queryValues, len(info.Args))
 
-			for j := 0; j < len(info.reqMeta.columns); j++ {
-				val, err := Marshal(info.reqMeta.columns[j].TypeInfo, args[j])
+			for j := 0; j < len(info.Args); j++ {
+				val, err := Marshal(info.Args[j].TypeInfo, args[j])
 				if err != nil {
 					return nil, err
 				}
@@ -770,13 +827,19 @@ func (c *Conn) executeBatch(batch *Batch) (*Iter, error) {
 	}
 
 	// TODO: should batch support tracing?
-	resp, err := c.exec(req, nil)
+	framer, err := c.exec(req, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := framer.parseFrame()
 	if err != nil {
 		return nil, err
 	}
 
 	switch x := resp.(type) {
 	case *resultVoidFrame:
+		framerPool.Put(framer)
 		return nil, nil
 	case *RequestErrUnprepared:
 		stmt, found := stmts[string(x.StatementId)]
@@ -785,6 +848,9 @@ func (c *Conn) executeBatch(batch *Batch) (*Iter, error) {
 			stmtsLRU.lru.Remove(c.addr + c.currentKeyspace + stmt)
 			stmtsLRU.Unlock()
 		}
+
+		framerPool.Put(framer)
+
 		if found {
 			return c.executeBatch(batch)
 		} else {
@@ -792,14 +858,17 @@ func (c *Conn) executeBatch(batch *Batch) (*Iter, error) {
 		}
 	case *resultRowsFrame:
 		iter := &Iter{
-			meta: x.meta,
-			rows: x.rows,
+			meta:   x.meta,
+			rows:   x.rows,
+			framer: framer,
 		}
 
 		return iter, nil
 	case error:
+		framerPool.Put(framer)
 		return nil, x
 	default:
+		framerPool.Put(framer)
 		return nil, NewErrProtocol("Unknown type in response to batch statement: %s", x)
 	}
 }
@@ -818,7 +887,7 @@ func (c *Conn) setKeepalive(d time.Duration) error {
 }
 
 type inflightPrepare struct {
-	info *resultPreparedFrame
+	info QueryInfo
 	err  error
 	wg   sync.WaitGroup
 }

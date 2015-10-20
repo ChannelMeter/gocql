@@ -182,56 +182,6 @@ func TestQueryRetry(t *testing.T) {
 	}
 }
 
-func TestSimplePoolRoundRobin(t *testing.T) {
-	servers := make([]*TestServer, 5)
-	addrs := make([]string, len(servers))
-	for n := 0; n < len(servers); n++ {
-		servers[n] = NewTestServer(t, defaultProto)
-		addrs[n] = servers[n].Address
-		defer servers[n].Stop()
-	}
-	cluster := NewCluster(addrs...)
-	cluster.ProtoVersion = defaultProto
-
-	db, err := cluster.CreateSession()
-	time.Sleep(1 * time.Second) // Sleep to allow the Cluster.fillPool to complete
-
-	if err != nil {
-		t.Fatalf("NewCluster: %v", err)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(5)
-	for n := 0; n < 5; n++ {
-		go func() {
-			for j := 0; j < 5; j++ {
-				if err := db.Query("void").Exec(); err != nil {
-					t.Fatal(err)
-				}
-			}
-			wg.Done()
-		}()
-	}
-	wg.Wait()
-
-	diff := 0
-	for n := 1; n < len(servers); n++ {
-		d := 0
-		if servers[n].nreq > servers[n-1].nreq {
-			d = int(servers[n].nreq - servers[n-1].nreq)
-		} else {
-			d = int(servers[n-1].nreq - servers[n].nreq)
-		}
-		if d > diff {
-			diff = d
-		}
-	}
-
-	if diff > 0 {
-		t.Errorf("Expected 0 difference in usage but was %d", diff)
-	}
-}
-
 func TestConnClosing(t *testing.T) {
 	t.Skip("Skipping until test can be ran reliably")
 
@@ -259,8 +209,7 @@ func TestConnClosing(t *testing.T) {
 	wg.Wait()
 
 	time.Sleep(1 * time.Second) //Sleep so the fillPool can complete.
-	pool := db.Pool.(ConnectionPool)
-	conns := pool.Size()
+	conns := db.pool.Size()
 
 	if conns != numConns {
 		t.Errorf("Expected to have %d connections but have %d", numConns, conns)
@@ -390,7 +339,9 @@ func TestRoundRobinConnPoolRoundRobin(t *testing.T) {
 
 	// create a new cluster using the policy-based round robin conn pool
 	cluster := NewCluster(addrs...)
-	cluster.ConnPoolType = NewRoundRobinConnPool
+	cluster.PoolConfig.HostSelectionPolicy = RoundRobinHostPolicy()
+	cluster.PoolConfig.ConnSelectionPolicy = RoundRobinConnPolicy()
+	cluster.disableControlConn = true
 
 	db, err := cluster.CreateSession()
 	if err != nil {
@@ -420,7 +371,7 @@ func TestRoundRobinConnPoolRoundRobin(t *testing.T) {
 
 	// wait for the pool to drain
 	time.Sleep(100 * time.Millisecond)
-	size := db.Pool.Size()
+	size := db.pool.Size()
 	if size != 0 {
 		t.Errorf("connection pool did not drain, still contains %d connections", size)
 	}
@@ -450,7 +401,8 @@ func TestPolicyConnPoolSSL(t *testing.T) {
 	defer srv.Stop()
 
 	cluster := createTestSslCluster(srv.Address, defaultProto, true)
-	cluster.ConnPoolType = NewRoundRobinConnPool
+	cluster.PoolConfig.HostSelectionPolicy = RoundRobinHostPolicy()
+	cluster.PoolConfig.ConnSelectionPolicy = RoundRobinConnPolicy()
 
 	db, err := cluster.CreateSession()
 	if err != nil {
@@ -465,7 +417,7 @@ func TestPolicyConnPoolSSL(t *testing.T) {
 
 	// wait for the pool to drain
 	time.Sleep(100 * time.Millisecond)
-	size := db.Pool.Size()
+	size := db.pool.Size()
 	if size != 0 {
 		t.Errorf("connection pool did not drain, still contains %d connections", size)
 	}

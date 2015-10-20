@@ -91,6 +91,8 @@ func Marshal(info TypeInfo, value interface{}) ([]byte, error) {
 		return marshalVarint(info, value)
 	case TypeInet:
 		return marshalInet(info, value)
+	case TypeTuple:
+		return marshalTuple(info, value)
 	case TypeUDT:
 		return marshalUDT(info, value)
 	}
@@ -1194,6 +1196,37 @@ func unmarshalInet(info TypeInfo, data []byte, value interface{}) error {
 	return unmarshalErrorf("cannot unmarshal %s into %T", info, value)
 }
 
+func marshalTuple(info TypeInfo, value interface{}) ([]byte, error) {
+	tuple := info.(TupleTypeInfo)
+	switch v := value.(type) {
+	case []interface{}:
+		var buf []byte
+
+		if len(v) != len(tuple.Elems) {
+			return nil, unmarshalErrorf("cannont marshal tuple: wrong number of elements")
+		}
+
+		for i, elem := range v {
+			data, err := Marshal(tuple.Elems[i], elem)
+			if err != nil {
+				return nil, err
+			}
+
+			n := len(data)
+			buf = append(buf, byte(n>>24),
+				byte(n>>16),
+				byte(n>>8),
+				byte(n))
+
+			buf = append(buf, data...)
+		}
+
+		return buf, nil
+	}
+
+	return nil, unmarshalErrorf("cannot marshal %T into %s", value, tuple)
+}
+
 // currently only support unmarshal into a list of values, this makes it possible
 // to support tuples without changing the query API. In the future this can be extend
 // to allow unmarshalling into custom tuple types.
@@ -1378,6 +1411,48 @@ func unmarshalUDT(info TypeInfo, data []byte, value interface{}) error {
 		}
 
 		return nil
+	case *map[string]interface{}:
+		udt := info.(UDTTypeInfo)
+
+		rv := reflect.ValueOf(value)
+		if rv.Kind() != reflect.Ptr {
+			return unmarshalErrorf("can not unmarshal into non-pointer %T", value)
+		}
+
+		rv = rv.Elem()
+		t := rv.Type()
+		if t.Kind() != reflect.Map {
+			return unmarshalErrorf("can not unmarshal %s into %T", info, value)
+		} else if data == nil {
+			rv.Set(reflect.Zero(t))
+			return nil
+		}
+
+		rv.Set(reflect.MakeMap(t))
+		m := *v
+
+		for _, e := range udt.Elements {
+			size := readInt(data[:4])
+			data = data[4:]
+
+			val := reflect.New(goType(e.Type))
+
+			var err error
+			if size < 0 {
+				err = Unmarshal(e.Type, nil, val.Interface())
+			} else {
+				err = Unmarshal(e.Type, data[:size], val.Interface())
+				data = data[size:]
+			}
+
+			if err != nil {
+				return err
+			}
+
+			m[e.Name] = val.Elem().Interface()
+		}
+
+		return nil
 	}
 
 	k := reflect.ValueOf(value).Elem()
@@ -1542,26 +1617,26 @@ type Type int
 
 const (
 	TypeCustom    Type = 0x0000
-	TypeAscii          = 0x0001
-	TypeBigInt         = 0x0002
-	TypeBlob           = 0x0003
-	TypeBoolean        = 0x0004
-	TypeCounter        = 0x0005
-	TypeDecimal        = 0x0006
-	TypeDouble         = 0x0007
-	TypeFloat          = 0x0008
-	TypeInt            = 0x0009
-	TypeTimestamp      = 0x000B
-	TypeUUID           = 0x000C
-	TypeVarchar        = 0x000D
-	TypeVarint         = 0x000E
-	TypeTimeUUID       = 0x000F
-	TypeInet           = 0x0010
-	TypeList           = 0x0020
-	TypeMap            = 0x0021
-	TypeSet            = 0x0022
-	TypeUDT            = 0x0030
-	TypeTuple          = 0x0031
+	TypeAscii     Type = 0x0001
+	TypeBigInt    Type = 0x0002
+	TypeBlob      Type = 0x0003
+	TypeBoolean   Type = 0x0004
+	TypeCounter   Type = 0x0005
+	TypeDecimal   Type = 0x0006
+	TypeDouble    Type = 0x0007
+	TypeFloat     Type = 0x0008
+	TypeInt       Type = 0x0009
+	TypeTimestamp Type = 0x000B
+	TypeUUID      Type = 0x000C
+	TypeVarchar   Type = 0x000D
+	TypeVarint    Type = 0x000E
+	TypeTimeUUID  Type = 0x000F
+	TypeInet      Type = 0x0010
+	TypeList      Type = 0x0020
+	TypeMap       Type = 0x0021
+	TypeSet       Type = 0x0022
+	TypeUDT       Type = 0x0030
+	TypeTuple     Type = 0x0031
 )
 
 // String returns the name of the identifier.

@@ -335,30 +335,18 @@ func componentColumnCountOfType(columns map[string]*ColumnMetadata, kind string)
 }
 
 // query only for the keyspace metadata for the specified keyspace from system.schema_keyspace
-func getKeyspaceMetadata(
-	session *Session,
-	keyspaceName string,
-) (*KeyspaceMetadata, error) {
-	query := session.Query(
-		`
+func getKeyspaceMetadata(session *Session, keyspaceName string) (*KeyspaceMetadata, error) {
+	const stmt = `
 		SELECT durable_writes, strategy_class, strategy_options
 		FROM system.schema_keyspaces
-		WHERE keyspace_name = ?
-		`,
-		keyspaceName,
-	)
-	// Set a routing key to avoid GetRoutingKey from computing the routing key
-	// TODO use a separate connection (pool) for system keyspace queries.
-	query.RoutingKey([]byte{})
+		WHERE keyspace_name = ?`
 
 	keyspace := &KeyspaceMetadata{Name: keyspaceName}
 	var strategyOptionsJSON []byte
 
-	err := query.Scan(
-		&keyspace.DurableWrites,
-		&keyspace.StrategyClass,
-		&strategyOptionsJSON,
-	)
+	iter := session.control.query(stmt, keyspaceName)
+	iter.Scan(&keyspace.DurableWrites, &keyspace.StrategyClass, &strategyOptionsJSON)
+	err := iter.Close()
 	if err != nil {
 		return nil, fmt.Errorf("Error querying keyspace schema: %v", err)
 	}
@@ -375,12 +363,20 @@ func getKeyspaceMetadata(
 }
 
 // query for only the table metadata in the specified keyspace from system.schema_columnfamilies
-func getTableMetadata(
-	session *Session,
-	keyspaceName string,
-) ([]TableMetadata, error) {
-	query := session.Query(
-		`
+func getTableMetadata(session *Session, keyspaceName string) ([]TableMetadata, error) {
+
+	var (
+		scan func(iter *Iter, table *TableMetadata) bool
+		stmt string
+
+		keyAliasesJSON    []byte
+		columnAliasesJSON []byte
+	)
+
+	if session.cfg.ProtoVersion < protoVersion4 {
+		// we have key aliases
+		// TODO: Do we need key_aliases?
+		stmt = `
 		SELECT
 			columnfamily_name,
 			key_validator,
@@ -390,29 +386,45 @@ func getTableMetadata(
 			column_aliases,
 			value_alias
 		FROM system.schema_columnfamilies
-		WHERE keyspace_name = ?
-		`,
-		keyspaceName,
-	)
-	// Set a routing key to avoid GetRoutingKey from computing the routing key
-	// TODO use a separate connection (pool) for system keyspace queries.
-	query.RoutingKey([]byte{})
-	iter := query.Iter()
+		WHERE keyspace_name = ?`
+
+		scan = func(iter *Iter, table *TableMetadata) bool {
+			return iter.Scan(
+				&table.Name,
+				&table.KeyValidator,
+				&table.Comparator,
+				&table.DefaultValidator,
+				&keyAliasesJSON,
+				&columnAliasesJSON,
+				&table.ValueAlias,
+			)
+		}
+	} else {
+		stmt = `
+		SELECT
+			columnfamily_name,
+			key_validator,
+			comparator,
+			default_validator
+		FROM system.schema_columnfamilies
+		WHERE keyspace_name = ?`
+
+		scan = func(iter *Iter, table *TableMetadata) bool {
+			return iter.Scan(
+				&table.Name,
+				&table.KeyValidator,
+				&table.Comparator,
+				&table.DefaultValidator,
+			)
+		}
+	}
+
+	iter := session.control.query(stmt, keyspaceName)
 
 	tables := []TableMetadata{}
 	table := TableMetadata{Keyspace: keyspaceName}
 
-	var keyAliasesJSON []byte
-	var columnAliasesJSON []byte
-	for iter.Scan(
-		&table.Name,
-		&table.KeyValidator,
-		&table.Comparator,
-		&table.DefaultValidator,
-		&keyAliasesJSON,
-		&columnAliasesJSON,
-		&table.ValueAlias,
-	) {
+	for scan(iter, &table) {
 		var err error
 
 		// decode the key aliases
@@ -532,11 +544,7 @@ func getColumnMetadata(
 
 	var indexOptionsJSON []byte
 
-	query := session.Query(stmt, keyspaceName)
-	// Set a routing key to avoid GetRoutingKey from computing the routing key
-	// TODO use a separate connection (pool) for system keyspace queries.
-	query.RoutingKey([]byte{})
-	iter := query.Iter()
+	iter := session.control.query(stmt, keyspaceName)
 
 	for scan(iter, &column, &indexOptionsJSON) {
 		var err error

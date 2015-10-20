@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,6 +23,7 @@ const (
 	protoVersion1      = 0x01
 	protoVersion2      = 0x02
 	protoVersion3      = 0x03
+	protoVersion4      = 0x04
 
 	maxFrameSize = 256 * 1024 * 1024
 )
@@ -53,21 +56,21 @@ type frameOp byte
 const (
 	// header ops
 	opError         frameOp = 0x00
-	opStartup               = 0x01
-	opReady                 = 0x02
-	opAuthenticate          = 0x03
-	opOptions               = 0x05
-	opSupported             = 0x06
-	opQuery                 = 0x07
-	opResult                = 0x08
-	opPrepare               = 0x09
-	opExecute               = 0x0A
-	opRegister              = 0x0B
-	opEvent                 = 0x0C
-	opBatch                 = 0x0D
-	opAuthChallenge         = 0x0E
-	opAuthResponse          = 0x0F
-	opAuthSuccess           = 0x10
+	opStartup       frameOp = 0x01
+	opReady         frameOp = 0x02
+	opAuthenticate  frameOp = 0x03
+	opOptions       frameOp = 0x05
+	opSupported     frameOp = 0x06
+	opQuery         frameOp = 0x07
+	opResult        frameOp = 0x08
+	opPrepare       frameOp = 0x09
+	opExecute       frameOp = 0x0A
+	opRegister      frameOp = 0x0B
+	opEvent         frameOp = 0x0C
+	opBatch         frameOp = 0x0D
+	opAuthChallenge frameOp = 0x0E
+	opAuthResponse  frameOp = 0x0F
+	opAuthSuccess   frameOp = 0x10
 )
 
 func (f frameOp) String() string {
@@ -119,21 +122,23 @@ const (
 
 	// rows flags
 	flagGlobalTableSpec int = 0x01
-	flagHasMorePages        = 0x02
-	flagNoMetaData          = 0x04
+	flagHasMorePages    int = 0x02
+	flagNoMetaData      int = 0x04
 
 	// query flags
 	flagValues                byte = 0x01
-	flagSkipMetaData               = 0x02
-	flagPageSize                   = 0x04
-	flagWithPagingState            = 0x08
-	flagWithSerialConsistency      = 0x10
-	flagDefaultTimestamp           = 0x20
-	flagWithNameValues             = 0x40
+	flagSkipMetaData          byte = 0x02
+	flagPageSize              byte = 0x04
+	flagWithPagingState       byte = 0x08
+	flagWithSerialConsistency byte = 0x10
+	flagDefaultTimestamp      byte = 0x20
+	flagWithNameValues        byte = 0x40
 
 	// header flags
-	flagCompress byte = 0x01
-	flagTracing       = 0x02
+	flagCompress      byte = 0x01
+	flagTracing       byte = 0x02
+	flagCustomPayload byte = 0x04
+	flagWarning       byte = 0x08
 )
 
 type Consistency uint16
@@ -172,6 +177,31 @@ func (c Consistency) String() string {
 		return "LOCAL_ONE"
 	default:
 		return fmt.Sprintf("UNKNOWN_CONS_0x%x", uint16(c))
+	}
+}
+
+func ParseConsistency(s string) Consistency {
+	switch strings.ToUpper(s) {
+	case "ANY":
+		return Any
+	case "ONE":
+		return One
+	case "TWO":
+		return Two
+	case "THREE":
+		return Three
+	case "QUORUM":
+		return Quorum
+	case "ALL":
+		return All
+	case "LOCAL_QUORUM":
+		return LocalQuorum
+	case "EACH_QUORUM":
+		return EachQuorum
+	case "LOCAL_ONE":
+		return LocalOne
+	default:
+		panic("invalid consistency: " + s)
 	}
 }
 
@@ -315,8 +345,8 @@ func readHeader(r io.Reader, p []byte) (head frameHeader, err error) {
 
 	version := p[0] & protoVersionMask
 
-	if version < protoVersion1 || version > protoVersion3 {
-		err = fmt.Errorf("invalid version: %x", version)
+	if version < protoVersion1 || version > protoVersion4 {
+		err = fmt.Errorf("gocql: invalid version: %x", version)
 		return
 	}
 
@@ -408,6 +438,14 @@ func (f *framer) parseFrame() (frame frame, err error) {
 		f.readTrace()
 	}
 
+	if f.header.flags&flagWarning == flagWarning {
+		warnings := f.readStringList()
+		// what to do with warnings?
+		for _, v := range warnings {
+			log.Println(v)
+		}
+	}
+
 	// asumes that the frame body has been read into rbuf
 	switch f.header.op {
 	case opError:
@@ -488,8 +526,25 @@ func (f *framer) parseErrorFrame() frame {
 		stmtId := f.readShortBytes()
 		return &RequestErrUnprepared{
 			errorFrame:  errD,
-			StatementId: stmtId,
+			StatementId: copyBytes(stmtId), // defensivly copy
 		}
+	case errReadFailure:
+		res := &RequestErrReadFailure{
+			errorFrame: errD,
+		}
+		res.Consistency = f.readConsistency()
+		res.Received = f.readInt()
+		res.BlockFor = f.readInt()
+		res.DataPresent = f.readByte() != 0
+		return res
+	case errFunctionFailure:
+		res := RequestErrFunctionFailure{
+			errorFrame: errD,
+		}
+		res.Keyspace = f.readString()
+		res.Function = f.readString()
+		res.ArgTypes = f.readStringList()
+		return res
 	default:
 		return &errD
 	}
@@ -600,6 +655,10 @@ type writeStartupFrame struct {
 	opts map[string]string
 }
 
+func (w writeStartupFrame) String() string {
+	return fmt.Sprintf("[startup opts=%+v]", w.opts)
+}
+
 func (w *writeStartupFrame) writeFrame(framer *framer, streamID int) error {
 	return framer.writeStartupFrame(streamID, w.opts)
 }
@@ -687,6 +746,74 @@ func (f *framer) readTypeInfo() TypeInfo {
 	}
 
 	return simple
+}
+
+type preparedMetadata struct {
+	resultMetadata
+
+	// proto v4+
+	pkeyColumns []int
+}
+
+func (r preparedMetadata) String() string {
+	return fmt.Sprintf("[paging_metadata flags=0x%x pkey=%q paging_state=% X columns=%v]", r.flags, r.pkeyColumns, r.pagingState, r.columns)
+}
+
+func (f *framer) parsePreparedMetadata() preparedMetadata {
+	// TODO: deduplicate this from parseMetadata
+	meta := preparedMetadata{}
+	meta.flags = f.readInt()
+
+	colCount := f.readInt()
+	if colCount < 0 {
+		panic(fmt.Errorf("received negative column count: %d", colCount))
+	}
+	meta.actualColCount = colCount
+
+	if f.proto >= protoVersion4 {
+		pkeyCount := f.readInt()
+		pkeys := make([]int, pkeyCount)
+		for i := 0; i < pkeyCount; i++ {
+			pkeys[i] = int(f.readShort())
+		}
+		meta.pkeyColumns = pkeys
+	}
+
+	if meta.flags&flagHasMorePages == flagHasMorePages {
+		meta.pagingState = f.readBytes()
+	}
+
+	if meta.flags&flagNoMetaData == flagNoMetaData {
+		return meta
+	}
+
+	var keyspace, table string
+	globalSpec := meta.flags&flagGlobalTableSpec == flagGlobalTableSpec
+	if globalSpec {
+		keyspace = f.readString()
+		table = f.readString()
+	}
+
+	var cols []ColumnInfo
+	if colCount < 1000 {
+		// preallocate columninfo to avoid excess copying
+		cols = make([]ColumnInfo, colCount)
+		for i := 0; i < colCount; i++ {
+			f.readCol(&cols[i], &meta.resultMetadata, globalSpec, keyspace, table)
+		}
+	} else {
+		// use append, huge number of columns usually indicates a corrupt frame or
+		// just a huge row.
+		for i := 0; i < colCount; i++ {
+			var col ColumnInfo
+			f.readCol(&col, &meta.resultMetadata, globalSpec, keyspace, table)
+			cols = append(cols, col)
+		}
+	}
+
+	meta.columns = cols
+
+	return meta
 }
 
 type resultMetadata struct {
@@ -858,7 +985,7 @@ type resultPreparedFrame struct {
 	frameHeader
 
 	preparedID []byte
-	reqMeta    resultMetadata
+	reqMeta    preparedMetadata
 	respMeta   resultMetadata
 }
 
@@ -866,7 +993,7 @@ func (f *framer) parseResultPrepared() frame {
 	frame := &resultPreparedFrame{
 		frameHeader: *f.header,
 		preparedID:  f.readShortBytes(),
-		reqMeta:     f.parseResultMetadata(),
+		reqMeta:     f.parsePreparedMetadata(),
 	}
 
 	if f.proto < protoVersion2 {
@@ -890,29 +1017,90 @@ func (s *resultSchemaChangeFrame) String() string {
 	return fmt.Sprintf("[result_schema_change change=%s keyspace=%s table=%s]", s.change, s.keyspace, s.table)
 }
 
-func (f *framer) parseResultSchemaChange() frame {
-	frame := &resultSchemaChangeFrame{
-		frameHeader: *f.header,
-	}
+type schemaChangeKeyspace struct {
+	frameHeader
 
-	if f.proto < protoVersion3 {
+	change   string
+	keyspace string
+}
+
+func (f schemaChangeKeyspace) String() string {
+	return fmt.Sprintf("[event schema_change_keyspace change=%q keyspace=%q]", f.change, f.keyspace)
+}
+
+type schemaChangeTable struct {
+	frameHeader
+
+	change   string
+	keyspace string
+	object   string
+}
+
+func (f schemaChangeTable) String() string {
+	return fmt.Sprintf("[event schema_change change=%q keyspace=%q object=%q]", f.change, f.keyspace, f.object)
+}
+
+type schemaChangeFunction struct {
+	frameHeader
+
+	change   string
+	keyspace string
+	name     string
+	args     []string
+}
+
+func (f *framer) parseResultSchemaChange() frame {
+	if f.proto <= protoVersion2 {
+		frame := &resultSchemaChangeFrame{
+			frameHeader: *f.header,
+		}
+
 		frame.change = f.readString()
 		frame.keyspace = f.readString()
 		frame.table = f.readString()
+
+		return frame
 	} else {
-		// TODO: improve type representation of this
-		frame.change = f.readString()
+		change := f.readString()
 		target := f.readString()
+
+		// TODO: could just use a seperate type for each target
 		switch target {
 		case "KEYSPACE":
+			frame := &schemaChangeKeyspace{
+				frameHeader: *f.header,
+				change:      change,
+			}
+
 			frame.keyspace = f.readString()
+
+			return frame
 		case "TABLE", "TYPE":
+			frame := &schemaChangeTable{
+				frameHeader: *f.header,
+				change:      change,
+			}
+
 			frame.keyspace = f.readString()
-			frame.table = f.readString()
+			frame.object = f.readString()
+
+			return frame
+		case "FUNCTION", "AGGREGATE":
+			frame := &schemaChangeFunction{
+				frameHeader: *f.header,
+				change:      change,
+			}
+
+			frame.keyspace = f.readString()
+			frame.name = f.readString()
+			frame.args = f.readStringList()
+
+			return frame
+		default:
+			panic(fmt.Errorf("gocql: unknown SCHEMA_CHANGE target: %q change: %q", target, change))
 		}
 	}
 
-	return frame
 }
 
 type authenticateFrame struct {
@@ -1209,6 +1397,17 @@ func (f *framer) writeBatchFrame(streamID int, w *writeBatchFrame) error {
 	return f.finishWrite()
 }
 
+type writeOptionsFrame struct{}
+
+func (w *writeOptionsFrame) writeFrame(framer *framer, streamID int) error {
+	return framer.writeOptionsFrame(streamID, w)
+}
+
+func (f *framer) writeOptionsFrame(stream int, _ *writeOptionsFrame) error {
+	f.writeHeader(f.flags, opOptions, stream)
+	return f.finishWrite()
+}
+
 func (f *framer) readByte() byte {
 	if len(f.rbuf) < 1 {
 		panic(fmt.Errorf("not enough bytes in buffer to read byte require 1 got: %d", len(f.rbuf)))
@@ -1304,13 +1503,7 @@ func (f *framer) readBytes() []byte {
 		panic(fmt.Errorf("not enough bytes in buffer to read bytes require %d got: %d", size, len(f.rbuf)))
 	}
 
-	// we cant make assumptions about the length of the life of the supplied byte
-	// slice so we defensivly copy it out of the underlying buffer. This has the
-	// downside of increasing allocs per read but will provide much greater memory
-	// safety. The allocs can hopefully be improved in the future.
-	// TODO: dont copy into a new slice
-	l := make([]byte, size)
-	copy(l, f.rbuf[:size])
+	l := f.rbuf[:size]
 	f.rbuf = f.rbuf[size:]
 
 	return l
@@ -1322,8 +1515,7 @@ func (f *framer) readShortBytes() []byte {
 		panic(fmt.Errorf("not enough bytes in buffer to read short bytes: require %d got %d", size, len(f.rbuf)))
 	}
 
-	l := make([]byte, size)
-	copy(l, f.rbuf[:size])
+	l := f.rbuf[:size]
 	f.rbuf = f.rbuf[size:]
 
 	return l
