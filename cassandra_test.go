@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/big"
@@ -210,10 +211,10 @@ func TestUseStatementError(t *testing.T) {
 
 	if err := session.Query("USE gocql_test").Exec(); err != nil {
 		if err != ErrUseStmt {
-			t.Error("expected ErrUseStmt, got " + err.Error())
+			t.Fatalf("expected ErrUseStmt, got " + err.Error())
 		}
 	} else {
-		t.Error("expected err, got nil.")
+		t.Fatal("expected err, got nil.")
 	}
 }
 
@@ -224,11 +225,11 @@ func TestInvalidKeyspace(t *testing.T) {
 	session, err := cluster.CreateSession()
 	if err != nil {
 		if err != ErrNoConnectionsStarted {
-			t.Errorf("Expected ErrNoConnections but got %v", err)
+			t.Fatalf("Expected ErrNoConnections but got %v", err)
 		}
 	} else {
 		session.Close() //Clean up the session
-		t.Error("expected err, got nil.")
+		t.Fatal("expected err, got nil.")
 	}
 }
 
@@ -244,19 +245,19 @@ func TestTracing(t *testing.T) {
 	trace := NewTraceWriter(session, buf)
 
 	if err := session.Query(`INSERT INTO trace (id) VALUES (?)`, 42).Trace(trace).Exec(); err != nil {
-		t.Error("insert:", err)
+		t.Fatal("insert:", err)
 	} else if buf.Len() == 0 {
-		t.Error("insert: failed to obtain any tracing")
+		t.Fatal("insert: failed to obtain any tracing")
 	}
 	buf.Reset()
 
 	var value int
 	if err := session.Query(`SELECT id FROM trace WHERE id = ?`, 42).Trace(trace).Scan(&value); err != nil {
-		t.Error("select:", err)
+		t.Fatal("select:", err)
 	} else if value != 42 {
-		t.Errorf("value: expected %d, got %d", 42, value)
+		t.Fatalf("value: expected %d, got %d", 42, value)
 	} else if buf.Len() == 0 {
-		t.Error("select: failed to obtain any tracing")
+		t.Fatal("select: failed to obtain any tracing")
 	}
 }
 
@@ -1136,7 +1137,7 @@ func injectInvalidPreparedStatement(t *testing.T, session *Session, table string
 		t.Fatal("create:", err)
 	}
 	stmt := "INSERT INTO " + table + " (foo, bar) VALUES (?, 7)"
-	conn := session.pool.Pick(nil)
+	_, conn := session.pool.Pick(nil)
 	flight := new(inflightPrepare)
 	stmtsLRU.Lock()
 	stmtsLRU.lru.Add(conn.addr+stmt, flight)
@@ -1159,7 +1160,7 @@ func injectInvalidPreparedStatement(t *testing.T, session *Session, table string
 
 func TestMissingSchemaPrepare(t *testing.T) {
 	s := createSession(t)
-	conn := s.pool.Pick(nil)
+	_, conn := s.pool.Pick(nil)
 	defer s.Close()
 
 	insertQry := &Query{stmt: "INSERT INTO invalidschemaprep (val) VALUES (?)", values: []interface{}{5}, cons: s.cons,
@@ -1208,7 +1209,7 @@ func TestQueryInfo(t *testing.T) {
 	session := createSession(t)
 	defer session.Close()
 
-	conn := session.pool.Pick(nil)
+	_, conn := session.pool.Pick(nil)
 	info, err := conn.prepareStatement("SELECT release_version, host_id FROM system.local WHERE key = ?", nil)
 
 	if err != nil {
@@ -2053,7 +2054,7 @@ func TestStream0(t *testing.T) {
 			break
 		}
 
-		conn = session.pool.Pick(nil)
+		_, conn = session.pool.Pick(nil)
 	}
 
 	if conn == nil {
@@ -2092,7 +2093,7 @@ func TestNegativeStream(t *testing.T) {
 			break
 		}
 
-		conn = session.pool.Pick(nil)
+		_, conn = session.pool.Pick(nil)
 	}
 
 	if conn == nil {
@@ -2269,4 +2270,162 @@ func TestJSONSupport(t *testing.T) {
 	if state != "TX" {
 		t.Errorf("got state %q expected %q", state, "TX")
 	}
+}
+
+func TestUDF(t *testing.T) {
+	if *flagProto < 4 {
+		t.Skip("skipping UDF support on proto < 4")
+	}
+
+	session := createSession(t)
+	defer session.Close()
+
+	const query = `CREATE OR REPLACE FUNCTION uniq(state set<text>, val text)
+	  CALLED ON NULL INPUT RETURNS set<text> LANGUAGE java
+	  AS 'state.add(val); return state;'`
+
+	err := session.Query(query).Exec()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDiscoverViaProxy(t *testing.T) {
+	// This (complicated) test tests that when the driver is given an initial host
+	// that is infact a proxy it discovers the rest of the ring behind the proxy
+	// and does not store the proxies address as a host in its connection pool.
+	// See https://github.com/gocql/gocql/issues/481
+	proxy, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("unable to create proxy listener: %v", err)
+	}
+
+	var (
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+		proxyConns []net.Conn
+		closed     bool
+	)
+
+	go func(wg *sync.WaitGroup) {
+		cassandraAddr := JoinHostPort(clusterHosts[0], 9042)
+
+		cassandra := func() (net.Conn, error) {
+			return net.Dial("tcp", cassandraAddr)
+		}
+
+		proxyFn := func(wg *sync.WaitGroup, from, to net.Conn) {
+			defer wg.Done()
+
+			_, err := io.Copy(to, from)
+			if err != nil {
+				mu.Lock()
+				if !closed {
+					t.Error(err)
+				}
+				mu.Unlock()
+			}
+		}
+
+		// handle dials cassandra and then proxies requests and reponsess. It waits
+		// for both the read and write side of the TCP connection to close before
+		// returning.
+		handle := func(conn net.Conn) error {
+			defer conn.Close()
+
+			cass, err := cassandra()
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			proxyConns = append(proxyConns, cass)
+			mu.Unlock()
+
+			defer cass.Close()
+
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go proxyFn(&wg, conn, cass)
+
+			wg.Add(1)
+			go proxyFn(&wg, cass, conn)
+
+			wg.Wait()
+
+			return nil
+		}
+
+		for {
+			// proxy just accepts connections and then proxies them to cassandra,
+			// it runs until it is closed.
+			conn, err := proxy.Accept()
+			if err != nil {
+				mu.Lock()
+				if !closed {
+					t.Error(err)
+				}
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			proxyConns = append(proxyConns, conn)
+			mu.Unlock()
+
+			wg.Add(1)
+			go func(conn net.Conn) {
+				defer wg.Done()
+
+				if err := handle(conn); err != nil {
+					t.Error(err)
+					return
+				}
+			}(conn)
+		}
+	}(&wg)
+
+	defer wg.Wait()
+
+	proxyAddr := proxy.Addr().String()
+
+	cluster := createCluster()
+	cluster.DiscoverHosts = true
+	cluster.NumConns = 1
+	cluster.Discovery.Sleep = 100 * time.Millisecond
+	// initial host is the proxy address
+	cluster.Hosts = []string{proxyAddr}
+
+	session := createSessionFromCluster(cluster, t)
+	defer session.Close()
+
+	if !session.hostSource.localHasRpcAddr {
+		t.Skip("Target cluster does not have rpc_address in system.local.")
+		goto close
+	}
+
+	// we shouldnt need this but to be safe
+	time.Sleep(1 * time.Second)
+
+	session.pool.mu.RLock()
+	for _, host := range clusterHosts {
+		if _, ok := session.pool.hostConnPools[host]; !ok {
+			t.Errorf("missing host in pool after discovery: %q", host)
+		}
+	}
+	session.pool.mu.RUnlock()
+
+close:
+	if err := proxy.Close(); err != nil {
+		t.Log(err)
+	}
+
+	mu.Lock()
+	closed = true
+	for _, conn := range proxyConns {
+		if err := conn.Close(); err != nil {
+			t.Log(err)
+		}
+	}
+	mu.Unlock()
 }
