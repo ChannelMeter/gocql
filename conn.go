@@ -158,18 +158,19 @@ func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler) (*Conn
 		headerSize = 9
 	}
 
-	if cfg.NumStreams <= 0 || cfg.NumStreams >= maxStreams {
-		cfg.NumStreams = maxStreams
+	streams := cfg.NumStreams
+	if streams <= 0 || streams >= maxStreams {
+		streams = maxStreams
 	} else {
-		cfg.NumStreams++
+		streams++
 	}
 
 	c := &Conn{
 		conn:         conn,
 		r:            bufio.NewReader(conn),
 		cfg:          cfg,
-		uniq:         make(chan int, cfg.NumStreams),
-		calls:        make([]callReq, cfg.NumStreams),
+		uniq:         make(chan int, streams),
+		calls:        make([]callReq, streams),
 		timeout:      cfg.Timeout,
 		version:      uint8(cfg.ProtoVersion),
 		addr:         conn.RemoteAddr().String(),
@@ -186,7 +187,7 @@ func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler) (*Conn
 
 	// reserve stream 0 incase cassandra returns an error on it without us sending
 	// a request.
-	for i := 1; i < cfg.NumStreams; i++ {
+	for i := 1; i < streams; i++ {
 		c.calls[i].resp = make(chan error)
 		c.uniq <- i
 	}
