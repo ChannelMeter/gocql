@@ -15,6 +15,8 @@ import (
 	"gopkg.in/inf.v0"
 )
 
+type AliasInt int
+
 var marshalTests = []struct {
 	Info  TypeInfo
 	Data  []byte
@@ -72,6 +74,11 @@ var marshalTests = []struct {
 		NativeType{proto: 2, typ: TypeInt},
 		[]byte("\x01\x02\x03\x04"),
 		int(16909060),
+	},
+	{
+		NativeType{proto: 2, typ: TypeInt},
+		[]byte("\x01\x02\x03\x04"),
+		AliasInt(16909060),
 	},
 	{
 		NativeType{proto: 2, typ: TypeInt},
@@ -257,8 +264,8 @@ var marshalTests = []struct {
 			NativeType: NativeType{proto: 2, typ: TypeSet},
 			Elem:       NativeType{proto: 2, typ: TypeInt},
 		},
-		[]byte(nil),
-		[]int(nil),
+		[]byte{0, 0}, // encoding of a list should always include the size of the collection
+		[]int{},
 	},
 	{
 		CollectionType{
@@ -275,8 +282,8 @@ var marshalTests = []struct {
 			Key:        NativeType{proto: 2, typ: TypeVarchar},
 			Elem:       NativeType{proto: 2, typ: TypeInt},
 		},
-		[]byte(nil),
-		map[string]int(nil),
+		[]byte{0, 0},
+		map[string]int{},
 	},
 	{
 		CollectionType{
@@ -895,5 +902,34 @@ func TestMarshalTuple(t *testing.T) {
 
 	if s1 != "foo" || s2 != "bar" {
 		t.Errorf("unmarshalTest: expected [foo, bar], got [%s, %s]", s1, s2)
+	}
+}
+
+func TestMarshalNil(t *testing.T) {
+	types := []Type{
+		TypeAscii,
+		TypeBlob,
+		TypeBoolean,
+		TypeBigInt,
+		TypeCounter,
+		TypeDecimal,
+		TypeDouble,
+		TypeFloat,
+		TypeInt,
+		TypeTimestamp,
+		TypeUUID,
+		TypeVarchar,
+		TypeVarint,
+		TypeTimeUUID,
+		TypeInet,
+	}
+
+	for _, typ := range types {
+		data, err := Marshal(NativeType{proto: 3, typ: typ}, nil)
+		if err != nil {
+			t.Errorf("unable to marshal nil %v: %v\n", typ, err)
+		} else if data != nil {
+			t.Errorf("expected to get nil byte for nil %v got % X", typ, data)
+		}
 	}
 }

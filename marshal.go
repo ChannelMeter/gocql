@@ -43,9 +43,6 @@ type Unmarshaler interface {
 // Marshal returns the CQL encoding of the value for the Cassandra
 // internal type described by the info parameter.
 func Marshal(info TypeInfo, value interface{}) ([]byte, error) {
-	if value == nil {
-		return nil, nil
-	}
 	if info.Version() < protoVersion1 {
 		panic("protocol version not set")
 	}
@@ -193,6 +190,11 @@ func marshalVarchar(info TypeInfo, value interface{}) ([]byte, error) {
 	case []byte:
 		return v, nil
 	}
+
+	if value == nil {
+		return nil, nil
+	}
+
 	rv := reflect.ValueOf(value)
 	t := rv.Type()
 	k := t.Kind()
@@ -290,8 +292,12 @@ func marshalInt(info TypeInfo, value interface{}) ([]byte, error) {
 		}
 		return encInt(int32(i)), nil
 	}
-	rv := reflect.ValueOf(value)
-	switch rv.Type().Kind() {
+
+	if value == nil {
+		return nil, nil
+	}
+
+	switch rv := reflect.ValueOf(value); rv.Type().Kind() {
 	case reflect.Int, reflect.Int64, reflect.Int32, reflect.Int16, reflect.Int8:
 		v := rv.Int()
 		if v > math.MaxInt32 || v < math.MinInt32 {
@@ -304,7 +310,12 @@ func marshalInt(info TypeInfo, value interface{}) ([]byte, error) {
 			return nil, marshalErrorf("marshal int: value %d out of range", v)
 		}
 		return encInt(int32(v)), nil
+	default:
+		if rv.IsNil() {
+			return nil, nil
+		}
 	}
+
 	return nil, marshalErrorf("can not marshal %T into %s", value, info)
 }
 
@@ -358,6 +369,11 @@ func marshalBigInt(info TypeInfo, value interface{}) ([]byte, error) {
 		}
 		return encBigInt(i), nil
 	}
+
+	if value == nil {
+		return nil, nil
+	}
+
 	rv := reflect.ValueOf(value)
 	switch rv.Type().Kind() {
 	case reflect.Int, reflect.Int64, reflect.Int32, reflect.Int16, reflect.Int8:
@@ -611,6 +627,11 @@ func marshalBool(info TypeInfo, value interface{}) ([]byte, error) {
 	case bool:
 		return encBool(v), nil
 	}
+
+	if value == nil {
+		return nil, nil
+	}
+
 	rv := reflect.ValueOf(value)
 	switch rv.Type().Kind() {
 	case reflect.Bool:
@@ -661,6 +682,11 @@ func marshalFloat(info TypeInfo, value interface{}) ([]byte, error) {
 	case float32:
 		return encInt(int32(math.Float32bits(v))), nil
 	}
+
+	if value == nil {
+		return nil, nil
+	}
+
 	rv := reflect.ValueOf(value)
 	switch rv.Type().Kind() {
 	case reflect.Float32:
@@ -697,6 +723,9 @@ func marshalDouble(info TypeInfo, value interface{}) ([]byte, error) {
 	case float64:
 		return encBigInt(int64(math.Float64bits(v))), nil
 	}
+	if value == nil {
+		return nil, nil
+	}
 	rv := reflect.ValueOf(value)
 	switch rv.Type().Kind() {
 	case reflect.Float64:
@@ -727,6 +756,10 @@ func unmarshalDouble(info TypeInfo, data []byte, value interface{}) error {
 }
 
 func marshalDecimal(info TypeInfo, value interface{}) ([]byte, error) {
+	if value == nil {
+		return nil, nil
+	}
+
 	switch v := value.(type) {
 	case Marshaler:
 		return v.MarshalCQL(info)
@@ -810,6 +843,11 @@ func marshalTimestamp(info TypeInfo, value interface{}) ([]byte, error) {
 		x := int64(v.UTC().Unix()*1e3) + int64(v.UTC().Nanosecond()/1e6)
 		return encBigInt(x), nil
 	}
+
+	if value == nil {
+		return nil, nil
+	}
+
 	rv := reflect.ValueOf(value)
 	switch rv.Type().Kind() {
 	case reflect.Int64:
@@ -881,9 +919,6 @@ func marshalList(info TypeInfo, value interface{}) ([]byte, error) {
 	k := t.Kind()
 	switch k {
 	case reflect.Slice, reflect.Array:
-		if k == reflect.Slice && rv.IsNil() {
-			return nil, nil
-		}
 		buf := &bytes.Buffer{}
 		n := rv.Len()
 
@@ -989,9 +1024,7 @@ func marshalMap(info TypeInfo, value interface{}) ([]byte, error) {
 	if t.Kind() != reflect.Map {
 		return nil, marshalErrorf("can not marshal %T into %s", value, info)
 	}
-	if rv.IsNil() {
-		return nil, nil
-	}
+
 	buf := &bytes.Buffer{}
 	n := rv.Len()
 
@@ -1087,6 +1120,11 @@ func marshalUUID(info TypeInfo, value interface{}) ([]byte, error) {
 		}
 		return b[:], nil
 	}
+
+	if value == nil {
+		return nil, nil
+	}
+
 	return nil, marshalErrorf("can not marshal %T into %s", value, info)
 }
 
@@ -1165,6 +1203,11 @@ func marshalInet(info TypeInfo, value interface{}) ([]byte, error) {
 		}
 		return nil, marshalErrorf("cannot marshal. invalid ip string %s", val)
 	}
+
+	if value == nil {
+		return nil, nil
+	}
+
 	return nil, marshalErrorf("cannot marshal %T into %s", value, info)
 }
 
@@ -1213,11 +1256,7 @@ func marshalTuple(info TypeInfo, value interface{}) ([]byte, error) {
 			}
 
 			n := len(data)
-			buf = append(buf, byte(n>>24),
-				byte(n>>16),
-				byte(n>>8),
-				byte(n))
-
+			buf = appendInt(buf, int32(n))
 			buf = append(buf, data...)
 		}
 
@@ -1289,13 +1328,12 @@ func marshalUDT(info TypeInfo, value interface{}) ([]byte, error) {
 				return nil, err
 			}
 
-			n := len(data)
-			buf = append(buf, byte(n>>24),
-				byte(n>>16),
-				byte(n>>8),
-				byte(n))
-
-			buf = append(buf, data...)
+			if data == nil && typeCanBeNull(e.Type) {
+				buf = appendInt(buf, -1)
+			} else {
+				buf = appendInt(buf, int32(len(data)))
+				buf = append(buf, data...)
+			}
 		}
 
 		return buf, nil
@@ -1312,13 +1350,12 @@ func marshalUDT(info TypeInfo, value interface{}) ([]byte, error) {
 				return nil, err
 			}
 
-			n := len(data)
-			buf = append(buf, byte(n>>24),
-				byte(n>>16),
-				byte(n>>8),
-				byte(n))
-
-			buf = append(buf, data...)
+			if data == nil && typeCanBeNull(e.Type) {
+				buf = appendInt(buf, -1)
+			} else {
+				buf = appendInt(buf, int32(len(data)))
+				buf = append(buf, data...)
+			}
 		}
 
 		return buf, nil
@@ -1354,14 +1391,15 @@ func marshalUDT(info TypeInfo, value interface{}) ([]byte, error) {
 		}
 
 		if !f.IsValid() {
-			return nil, marshalErrorf("cannot marshal %T into %s", value, info)
+			if _, ok := e.Type.(CollectionType); ok {
+				f = reflect.Zero(goType(e.Type))
+			} else {
+				buf = appendInt(buf, -1)
+				continue
+			}
 		} else if f.Kind() == reflect.Ptr {
 			if f.IsNil() {
-				n := -1
-				buf = append(buf, byte(n>>24),
-					byte(n>>16),
-					byte(n>>8),
-					byte(n))
+				buf = appendInt(buf, -1)
 				continue
 			} else {
 				f = f.Elem()
@@ -1373,13 +1411,12 @@ func marshalUDT(info TypeInfo, value interface{}) ([]byte, error) {
 			return nil, err
 		}
 
-		n := len(data)
-		buf = append(buf, byte(n>>24),
-			byte(n>>16),
-			byte(n>>8),
-			byte(n))
-
-		buf = append(buf, data...)
+		if data == nil && typeCanBeNull(e.Type) {
+			buf = appendInt(buf, -1)
+		} else {
+			buf = appendInt(buf, int32(len(data)))
+			buf = append(buf, data...)
+		}
 	}
 
 	return buf, nil
