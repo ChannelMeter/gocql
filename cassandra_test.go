@@ -4,10 +4,7 @@ package gocql
 
 import (
 	"bytes"
-	"flag"
-	"fmt"
 	"io"
-	"log"
 	"math"
 	"math/big"
 	"net"
@@ -21,118 +18,6 @@ import (
 
 	"gopkg.in/inf.v0"
 )
-
-var (
-	flagCluster      = flag.String("cluster", "127.0.0.1", "a comma-separated list of host:port tuples")
-	flagProto        = flag.Int("proto", 2, "protcol version")
-	flagCQL          = flag.String("cql", "3.0.0", "CQL version")
-	flagRF           = flag.Int("rf", 1, "replication factor for test keyspace")
-	clusterSize      = flag.Int("clusterSize", 1, "the expected size of the cluster")
-	flagRetry        = flag.Int("retries", 5, "number of times to retry queries")
-	flagAutoWait     = flag.Duration("autowait", 1000*time.Millisecond, "time to wait for autodiscovery to fill the hosts poll")
-	flagRunSslTest   = flag.Bool("runssl", false, "Set to true to run ssl test")
-	flagRunAuthTest  = flag.Bool("runauth", false, "Set to true to run authentication test")
-	flagCompressTest = flag.String("compressor", "", "compressor to use")
-	flagTimeout      = flag.Duration("gocql.timeout", 5*time.Second, "sets the connection `timeout` for all operations")
-	clusterHosts     []string
-)
-
-func init() {
-	flag.Parse()
-	clusterHosts = strings.Split(*flagCluster, ",")
-	log.SetFlags(log.Lshortfile | log.LstdFlags)
-}
-
-func addSslOptions(cluster *ClusterConfig) *ClusterConfig {
-	if *flagRunSslTest {
-		cluster.SslOpts = &SslOptions{
-			CertPath:               "testdata/pki/gocql.crt",
-			KeyPath:                "testdata/pki/gocql.key",
-			CaPath:                 "testdata/pki/ca.crt",
-			EnableHostVerification: false,
-		}
-	}
-	return cluster
-}
-
-var initOnce sync.Once
-
-func createTable(s *Session, table string) error {
-	if err := s.control.query(table).Close(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func createCluster() *ClusterConfig {
-	cluster := NewCluster(clusterHosts...)
-	cluster.ProtoVersion = *flagProto
-	cluster.CQLVersion = *flagCQL
-	cluster.Timeout = *flagTimeout
-	cluster.Consistency = Quorum
-	cluster.MaxWaitSchemaAgreement = 2 * time.Minute // travis might be slow
-	if *flagRetry > 0 {
-		cluster.RetryPolicy = &SimpleRetryPolicy{NumRetries: *flagRetry}
-	}
-
-	switch *flagCompressTest {
-	case "snappy":
-		cluster.Compressor = &SnappyCompressor{}
-	case "":
-	default:
-		panic("invalid compressor: " + *flagCompressTest)
-	}
-
-	cluster = addSslOptions(cluster)
-	return cluster
-}
-
-func createKeyspace(tb testing.TB, cluster *ClusterConfig, keyspace string) {
-	c := *cluster
-	c.Keyspace = "system"
-	c.Timeout = 20 * time.Second
-	session, err := c.CreateSession()
-	if err != nil {
-		tb.Fatal("createSession:", err)
-	}
-
-	err = session.control.query(`DROP KEYSPACE IF EXISTS ` + keyspace).Close()
-	if err != nil {
-		tb.Fatal(err)
-	}
-
-	err = session.control.query(fmt.Sprintf(`CREATE KEYSPACE %s
-	WITH replication = {
-		'class' : 'SimpleStrategy',
-		'replication_factor' : %d
-	}`, keyspace, *flagRF)).Close()
-
-	if err != nil {
-		tb.Fatal(err)
-	}
-}
-
-func createSessionFromCluster(cluster *ClusterConfig, tb testing.TB) *Session {
-	// Drop and re-create the keyspace once. Different tests should use their own
-	// individual tables, but can assume that the table does not exist before.
-	initOnce.Do(func() {
-		createKeyspace(tb, cluster, "gocql_test")
-	})
-
-	cluster.Keyspace = "gocql_test"
-	session, err := cluster.CreateSession()
-	if err != nil {
-		tb.Fatal("createSession:", err)
-	}
-
-	return session
-}
-
-func createSession(tb testing.TB) *Session {
-	cluster := createCluster()
-	return createSessionFromCluster(cluster, tb)
-}
 
 // TestAuthentication verifies that gocql will work with a host configured to only accept authenticated connections
 func TestAuthentication(t *testing.T) {
@@ -165,7 +50,6 @@ func TestAuthentication(t *testing.T) {
 func TestRingDiscovery(t *testing.T) {
 	cluster := createCluster()
 	cluster.Hosts = clusterHosts[:1]
-	cluster.DiscoverHosts = true
 
 	session := createSessionFromCluster(cluster, t)
 	defer session.Close()
@@ -336,8 +220,8 @@ func TestCAS(t *testing.T) {
 	}
 
 	if _, err := session.Query(`DELETE FROM cas_table WHERE title = ? and revid = ? IF last_modified = ?`,
-		title, revid, tenSecondsLater).ScanCAS(); err.Error() != "count mismatch" {
-		t.Fatalf("delete: was expecting count mismatch error but got %s", err)
+		title, revid, tenSecondsLater).ScanCAS(); !strings.HasPrefix(err.Error(), "gocql: not enough columns to scan into") {
+		t.Fatal("delete: was expecting count mismatch error but got: %q", err.Error())
 	}
 
 	if applied, err := session.Query(`DELETE FROM cas_table WHERE title = ? and revid = ? IF last_modified = ?`,
@@ -356,7 +240,7 @@ func TestCAS(t *testing.T) {
 	if applied, _, err := session.ExecuteBatchCAS(successBatch, &titleCAS, &revidCAS, &modifiedCAS); err != nil {
 		t.Fatal("insert:", err)
 	} else if !applied {
-		t.Fatal("insert should have been applied")
+		t.Fatalf("insert should have been applied: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
 	}
 
 	successBatch = session.NewBatch(LoggedBatch)
@@ -373,7 +257,7 @@ func TestCAS(t *testing.T) {
 	if applied, _, err := session.ExecuteBatchCAS(successBatch, &titleCAS, &revidCAS, &modifiedCAS); err != nil {
 		t.Fatal("insert:", err)
 	} else if applied {
-		t.Fatal("insert shouldn't have been applied")
+		t.Fatalf("insert should have been applied: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
 	}
 
 	insertBatch := session.NewBatch(LoggedBatch)
@@ -389,10 +273,10 @@ func TestCAS(t *testing.T) {
 	if applied, iter, err := session.ExecuteBatchCAS(failBatch, &titleCAS, &revidCAS, &modifiedCAS); err != nil {
 		t.Fatal("insert:", err)
 	} else if applied {
-		t.Fatal("insert shouldn't have been applied")
+		t.Fatalf("insert should have been applied: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
 	} else {
 		if scan := iter.Scan(&applied, &titleCAS, &revidCAS, &modifiedCAS); scan && applied {
-			t.Fatal("insert shouldn't have been applied")
+			t.Fatalf("insert should have been applied: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
 		} else if !scan {
 			t.Fatal("should have scanned another row")
 		}
@@ -428,7 +312,7 @@ func TestMapScanCAS(t *testing.T) {
 		title, revid, modified, deleted).MapScanCAS(mapCAS); err != nil {
 		t.Fatal("insert:", err)
 	} else if !applied {
-		t.Fatal("insert should have been applied")
+		t.Fatalf("insert should have been applied: title=%v revID=%v modified=%v", title, revid, modified)
 	}
 
 	mapCAS = map[string]interface{}{}
@@ -437,7 +321,7 @@ func TestMapScanCAS(t *testing.T) {
 		title, revid, modified, deleted).MapScanCAS(mapCAS); err != nil {
 		t.Fatal("insert:", err)
 	} else if applied {
-		t.Fatal("insert should not have been applied")
+		t.Fatalf("insert should have been applied: title=%v revID=%v modified=%v", title, revid, modified)
 	} else if title != mapCAS["title"] || revid != mapCAS["revid"] || deleted != mapCAS["deleted"] {
 		t.Fatalf("expected %s/%v/%v/%v but got %s/%v/%v%v", title, revid, modified, false, mapCAS["title"], mapCAS["revid"], mapCAS["last_modified"], mapCAS["deleted"])
 	}
@@ -648,10 +532,6 @@ func TestCreateSessionTimeout(t *testing.T) {
 	if err == nil {
 		session.Close()
 		t.Fatal("expected ErrNoConnectionsStarted, but no error was returned.")
-	}
-
-	if err != ErrNoConnectionsStarted {
-		t.Fatalf("expected ErrNoConnectionsStarted, but received %v", err)
 	}
 }
 
@@ -2001,13 +1881,12 @@ func TestRoutingKey(t *testing.T) {
 func TestTokenAwareConnPool(t *testing.T) {
 	cluster := createCluster()
 	cluster.PoolConfig.HostSelectionPolicy = TokenAwareHostPolicy(RoundRobinHostPolicy())
-	cluster.DiscoverHosts = true
 
 	session := createSessionFromCluster(cluster, t)
 	defer session.Close()
 
-	if session.pool.Size() != cluster.NumConns*len(cluster.Hosts) {
-		t.Errorf("Expected pool size %d but was %d", cluster.NumConns*len(cluster.Hosts), session.pool.Size())
+	if expected := cluster.NumConns * len(session.ring.allHosts()); session.pool.Size() != expected {
+		t.Errorf("Expected pool size %d but was %d", expected, session.pool.Size())
 	}
 
 	if err := createTable(session, "CREATE TABLE gocql_test.test_token_aware (id int, data text, PRIMARY KEY (id))"); err != nil {
@@ -2284,7 +2163,7 @@ func TestDiscoverViaProxy(t *testing.T) {
 	// that is infact a proxy it discovers the rest of the ring behind the proxy
 	// and does not store the proxies address as a host in its connection pool.
 	// See https://github.com/gocql/gocql/issues/481
-	proxy, err := net.Listen("tcp", ":0")
+	proxy, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("unable to create proxy listener: %v", err)
 	}
@@ -2379,9 +2258,7 @@ func TestDiscoverViaProxy(t *testing.T) {
 	proxyAddr := proxy.Addr().String()
 
 	cluster := createCluster()
-	cluster.DiscoverHosts = true
 	cluster.NumConns = 1
-	cluster.Discovery.Sleep = 100 * time.Millisecond
 	// initial host is the proxy address
 	cluster.Hosts = []string{proxyAddr}
 
@@ -2417,4 +2294,40 @@ close:
 		}
 	}
 	mu.Unlock()
+}
+
+func TestUnmarshallNestedTypes(t *testing.T) {
+	if *flagProto < protoVersion3 {
+		t.Skip("can not have frozen types in cassandra < 2.1.3")
+	}
+	session := createSession(t)
+	defer session.Close()
+
+	if err := createTable(session, `CREATE TABLE gocql_test.test_557 (
+		    id text PRIMARY KEY,
+		    val list<frozen<map<text, text> > >
+		)`); err != nil {
+
+		t.Fatal(err)
+	}
+
+	m := []map[string]string{
+		{"key1": "val1"},
+		{"key2": "val2"},
+	}
+
+	const id = "key"
+	err := session.Query("INSERT INTO test_557(id, val) VALUES(?, ?)", id, m).Exec()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var data []map[string]string
+	if err := session.Query("SELECT val FROM test_557 WHERE id = ?", id).Scan(&data); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(data, m) {
+		t.Fatalf("%+#v != %+#v", data, m)
+	}
 }

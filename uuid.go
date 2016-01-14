@@ -269,3 +269,12 @@ func (uuid *UUID) Unmarshal(data []byte) error {
 func (uuid *UUID) Size() int {
 	return 16
 }
+
+func (u UUID) MarshalText() ([]byte, error) {
+	return []byte(u.String()), nil
+}
+
+func (u *UUID) UnmarshalText(text []byte) (err error) {
+	*u, err = ParseUUID(string(text))
+	return
+}
