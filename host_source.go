@@ -32,6 +32,9 @@ type cassVersion struct {
 func (c *cassVersion) UnmarshalCQL(info TypeInfo, data []byte) error {
 	version := strings.TrimSuffix(string(data), "-SNAPSHOT")
 	v := strings.Split(version, ".")
+	if len(v) == 2 {
+		v = append(v, "0")
+	}
 	if len(v) < 3 {
 		return fmt.Errorf("invalid schema_version: %v", string(data))
 	}

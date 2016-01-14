@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gocql/gocql/internal/streams"
+	"github.com/channelmeter/gocql/internal/streams"
 )
 
 var (
