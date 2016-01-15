@@ -548,7 +548,7 @@ func (c *Conn) exec(req frameWriter, tracer Tracer) (*framer, error) {
 	case <-time.After(c.timeout):
 		close(call.timeout)
 		c.handleTimeout()
-		return nil, ErrTimeoutNoResponse
+		return nil, ErrTimeoutNoResponse(c.Address())
 	case <-c.quit:
 		return nil, ErrConnectionClosed
 	}
@@ -1001,10 +1001,14 @@ type inflightPrepare struct {
 	wg   sync.WaitGroup
 }
 
+func ErrTimeoutNoResponse(host string) error {
+	return errors.New("gocql: no response received from cassandra within timeout period (" + host + ")")
+}
+
 var (
-	ErrQueryArgLength    = errors.New("gocql: query argument length mismatch")
-	ErrTimeoutNoResponse = errors.New("gocql: no response received from cassandra within timeout period")
-	ErrTooManyTimeouts   = errors.New("gocql: too many query timeouts on the connection")
-	ErrConnectionClosed  = errors.New("gocql: connection closed waiting for response")
-	ErrNoStreams         = errors.New("gocql: no streams available on connection")
+	ErrQueryArgLength = errors.New("gocql: query argument length mismatch")
+	//ErrTimeoutNoResponse = errors.New("gocql: no response received from cassandra within timeout period")
+	ErrTooManyTimeouts  = errors.New("gocql: too many query timeouts on the connection")
+	ErrConnectionClosed = errors.New("gocql: connection closed waiting for response")
+	ErrNoStreams        = errors.New("gocql: no streams available on connection")
 )
