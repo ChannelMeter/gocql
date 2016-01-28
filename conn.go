@@ -5,7 +5,6 @@
 package gocql
 
 import (
-	"bufio"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -114,7 +113,7 @@ var TimeoutLimit int64 = 10
 // level API.
 type Conn struct {
 	conn    net.Conn
-	r       *bufio.Reader
+	r       io.Reader
 	timeout time.Duration
 	cfg     *ConnConfig
 
@@ -176,7 +175,7 @@ func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler, sessio
 
 	c := &Conn{
 		conn:         conn,
-		r:            bufio.NewReader(conn),
+		r:            conn,
 		cfg:          cfg,
 		calls:        make(map[int]*callReq),
 		timeout:      cfg.Timeout,
