@@ -461,11 +461,7 @@ func TestTooManyQueryArgs(t *testing.T) {
 	_, err := session.Query(`SELECT * FROM too_many_query_args WHERE id = ?`, 1, 2).Iter().SliceMap()
 
 	if err == nil {
-		t.Fatal("'`SELECT * FROM too_many_query_args WHERE id = ?`, 1, 2' should return an ErrQueryArgLength")
-	}
-
-	if err != ErrQueryArgLength {
-		t.Fatalf("'`SELECT * FROM too_many_query_args WHERE id = ?`, 1, 2' should return an ErrQueryArgLength, but returned: %s", err)
+		t.Fatal("'`SELECT * FROM too_many_query_args WHERE id = ?`, 1, 2' should return an error")
 	}
 
 	batch := session.NewBatch(UnloggedBatch)
@@ -473,12 +469,10 @@ func TestTooManyQueryArgs(t *testing.T) {
 	err = session.ExecuteBatch(batch)
 
 	if err == nil {
-		t.Fatal("'`INSERT INTO too_many_query_args (id, value) VALUES (?, ?)`, 1, 2, 3' should return an ErrQueryArgLength")
+		t.Fatal("'`INSERT INTO too_many_query_args (id, value) VALUES (?, ?)`, 1, 2, 3' should return an error")
 	}
 
-	if err != ErrQueryArgLength {
-		t.Fatalf("'INSERT INTO too_many_query_args (id, value) VALUES (?, ?)`, 1, 2, 3' should return an ErrQueryArgLength, but returned: %s", err)
-	}
+	// TODO: should indicate via an error code that it is an invalid arg?
 
 }
 
@@ -498,11 +492,7 @@ func TestNotEnoughQueryArgs(t *testing.T) {
 	_, err := session.Query(`SELECT * FROM not_enough_query_args WHERE id = ? and cluster = ?`, 1).Iter().SliceMap()
 
 	if err == nil {
-		t.Fatal("'`SELECT * FROM not_enough_query_args WHERE id = ? and cluster = ?`, 1' should return an ErrQueryArgLength")
-	}
-
-	if err != ErrQueryArgLength {
-		t.Fatalf("'`SELECT * FROM too_few_query_args WHERE id = ? and cluster = ?`, 1' should return an ErrQueryArgLength, but returned: %s", err)
+		t.Fatal("'`SELECT * FROM not_enough_query_args WHERE id = ? and cluster = ?`, 1' should return an error")
 	}
 
 	batch := session.NewBatch(UnloggedBatch)
@@ -510,11 +500,7 @@ func TestNotEnoughQueryArgs(t *testing.T) {
 	err = session.ExecuteBatch(batch)
 
 	if err == nil {
-		t.Fatal("'`INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)`, 1, 2' should return an ErrQueryArgLength")
-	}
-
-	if err != ErrQueryArgLength {
-		t.Fatalf("'INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)`, 1, 2' should return an ErrQueryArgLength, but returned: %s", err)
+		t.Fatal("'`INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)`, 1, 2' should return an error")
 	}
 }
 
@@ -1008,18 +994,24 @@ func injectInvalidPreparedStatement(t *testing.T, session *Session, table string
 	stmt := "INSERT INTO " + table + " (foo, bar) VALUES (?, 7)"
 	_, conn := session.pool.Pick(nil)
 	flight := new(inflightPrepare)
-	stmtsLRU.Lock()
-	stmtsLRU.lru.Add(conn.addr+stmt, flight)
-	stmtsLRU.Unlock()
-	flight.info = QueryInfo{
-		Id: []byte{'f', 'o', 'o', 'b', 'a', 'r'},
-		Args: []ColumnInfo{
-			{
-				Keyspace: "gocql_test",
-				Table:    table,
-				Name:     "foo",
-				TypeInfo: NativeType{
-					typ: TypeVarchar,
+	session.stmtsLRU.Lock()
+	session.stmtsLRU.lru.Add(conn.addr+stmt, flight)
+	session.stmtsLRU.Unlock()
+	flight.preparedStatment = &preparedStatment{
+		id: []byte{'f', 'o', 'o', 'b', 'a', 'r'},
+		request: preparedMetadata{
+			resultMetadata: resultMetadata{
+				colCount:       1,
+				actualColCount: 1,
+				columns: []ColumnInfo{
+					{
+						Keyspace: "gocql_test",
+						Table:    table,
+						Name:     "foo",
+						TypeInfo: NativeType{
+							typ: TypeVarchar,
+						},
+					},
 				},
 			},
 		},
@@ -1068,7 +1060,7 @@ func TestReprepareBatch(t *testing.T) {
 	stmt, conn := injectInvalidPreparedStatement(t, session, "test_reprepare_statement_batch")
 	batch := session.NewBatch(UnloggedBatch)
 	batch.Query(stmt, "bar")
-	if _, err := conn.executeBatch(batch); err != nil {
+	if err := conn.executeBatch(batch).Close(); err != nil {
 		t.Fatalf("Failed to execute query for reprepare statement: %v", err)
 	}
 
@@ -1085,12 +1077,12 @@ func TestQueryInfo(t *testing.T) {
 		t.Fatalf("Failed to execute query for preparing statement: %v", err)
 	}
 
-	if x := len(info.Args); x != 1 {
+	if x := len(info.request.columns); x != 1 {
 		t.Fatalf("Was not expecting meta data for %d query arguments, but got %d\n", 1, x)
 	}
 
 	if *flagProto > 1 {
-		if x := len(info.Rval); x != 2 {
+		if x := len(info.response.columns); x != 2 {
 			t.Fatalf("Was not expecting meta data for %d result columns, but got %d\n", 2, x)
 		}
 	}
@@ -1098,11 +1090,13 @@ func TestQueryInfo(t *testing.T) {
 
 //TestPreparedCacheEviction will make sure that the cache size is maintained
 func TestPreparedCacheEviction(t *testing.T) {
-	session := createSession(t)
+	const maxPrepared = 4
+	cluster := createCluster()
+	cluster.MaxPreparedStmts = maxPrepared
+	cluster.Events.DisableSchemaEvents = true
+
+	session := createSessionFromCluster(cluster, t)
 	defer session.Close()
-	stmtsLRU.Lock()
-	stmtsLRU.Max(4)
-	stmtsLRU.Unlock()
 
 	if err := createTable(session, "CREATE TABLE gocql_test.prepcachetest (id int,mod int,PRIMARY KEY (id))"); err != nil {
 		t.Fatalf("failed to create table with error '%v'", err)
@@ -1140,33 +1134,33 @@ func TestPreparedCacheEviction(t *testing.T) {
 		t.Fatalf("insert into prepcachetest failed, error '%v'", err)
 	}
 
-	stmtsLRU.Lock()
+	session.stmtsLRU.Lock()
 
 	//Make sure the cache size is maintained
-	if stmtsLRU.lru.Len() != stmtsLRU.lru.MaxEntries {
-		t.Fatalf("expected cache size of %v, got %v", stmtsLRU.lru.MaxEntries, stmtsLRU.lru.Len())
+	if session.stmtsLRU.lru.Len() != session.stmtsLRU.lru.MaxEntries {
+		t.Fatalf("expected cache size of %v, got %v", session.stmtsLRU.lru.MaxEntries, session.stmtsLRU.lru.Len())
 	}
 
 	//Walk through all the configured hosts and test cache retention and eviction
 	var selFound, insFound, updFound, delFound, selEvict bool
 	for i := range session.cfg.Hosts {
-		_, ok := stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testSELECT id,mod FROM prepcachetest WHERE id = 1")
+		_, ok := session.stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testSELECT id,mod FROM prepcachetest WHERE id = 1")
 		selFound = selFound || ok
 
-		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testINSERT INTO prepcachetest (id,mod) VALUES (?, ?)")
+		_, ok = session.stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testINSERT INTO prepcachetest (id,mod) VALUES (?, ?)")
 		insFound = insFound || ok
 
-		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testUPDATE prepcachetest SET mod = ? WHERE id = ?")
+		_, ok = session.stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testUPDATE prepcachetest SET mod = ? WHERE id = ?")
 		updFound = updFound || ok
 
-		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testDELETE FROM prepcachetest WHERE id = ?")
+		_, ok = session.stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testDELETE FROM prepcachetest WHERE id = ?")
 		delFound = delFound || ok
 
-		_, ok = stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testSELECT id,mod FROM prepcachetest WHERE id = 0")
+		_, ok = session.stmtsLRU.lru.Get(session.cfg.Hosts[i] + ":9042gocql_testSELECT id,mod FROM prepcachetest WHERE id = 0")
 		selEvict = selEvict || !ok
 	}
 
-	stmtsLRU.Unlock()
+	session.stmtsLRU.Unlock()
 
 	if !selEvict {
 		t.Fatalf("expected first select statement to be purged, but statement was found in the cache.")
@@ -1906,51 +1900,6 @@ func TestTokenAwareConnPool(t *testing.T) {
 	// TODO add verification that the query went to the correct host
 }
 
-type frameWriterFunc func(framer *framer, streamID int) error
-
-func (f frameWriterFunc) writeFrame(framer *framer, streamID int) error {
-	return f(framer, streamID)
-}
-
-func TestStream0(t *testing.T) {
-	session := createSession(t)
-	defer session.Close()
-
-	var conn *Conn
-	for i := 0; i < 5; i++ {
-		if conn != nil {
-			break
-		}
-
-		_, conn = session.pool.Pick(nil)
-	}
-
-	if conn == nil {
-		t.Fatal("no connections available in the pool")
-	}
-
-	writer := frameWriterFunc(func(f *framer, streamID int) error {
-		if streamID == 0 {
-			t.Fatal("should not use stream 0 for requests")
-		}
-		f.writeHeader(0, opError, streamID)
-		f.writeString("i am a bad frame")
-		f.wbuf[0] = 0xFF
-		return f.finishWrite()
-	})
-
-	const expErr = "gocql: error on stream 0:"
-	// need to write out an invalid frame, which we need a connection to do
-	frame, err := conn.exec(writer, nil)
-	if err == nil {
-		t.Fatal("expected to get an error on stream 0")
-	} else if !strings.HasPrefix(err.Error(), expErr) {
-		t.Fatalf("expected to get error prefix %q got %q", expErr, err.Error())
-	} else if frame != nil {
-		t.Fatalf("expected to get nil frame got %+v", frame)
-	}
-}
-
 func TestNegativeStream(t *testing.T) {
 	session := createSession(t)
 	defer session.Close()
@@ -2029,7 +1978,7 @@ func TestManualQueryPaging(t *testing.T) {
 	}
 
 	if fetched != rowsToInsert {
-		t.Fatalf("expected to fetch %d rows got %d", fetched, rowsToInsert)
+		t.Fatalf("expected to fetch %d rows got %d", rowsToInsert, fetched)
 	}
 }
 
@@ -2282,12 +2231,12 @@ func TestDiscoverViaProxy(t *testing.T) {
 	session.pool.mu.RUnlock()
 
 close:
+	mu.Lock()
+	closed = true
 	if err := proxy.Close(); err != nil {
 		t.Log(err)
 	}
 
-	mu.Lock()
-	closed = true
 	for _, conn := range proxyConns {
 		if err := conn.Close(); err != nil {
 			t.Log(err)

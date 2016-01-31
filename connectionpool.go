@@ -168,7 +168,7 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 	for addr := range toRemove {
 		pool := p.hostConnPools[addr]
 		delete(p.hostConnPools, addr)
-		pool.Close()
+		go pool.Close()
 	}
 
 	// update the policy
@@ -188,6 +188,13 @@ func (p *policyConnPool) Size() int {
 	p.mu.RUnlock()
 
 	return count
+}
+
+func (p *policyConnPool) getPool(addr string) (pool *hostConnPool, ok bool) {
+	p.mu.RLock()
+	pool, ok = p.hostConnPools[addr]
+	p.mu.RUnlock()
+	return
 }
 
 func (p *policyConnPool) Pick(qry *Query) (SelectedHost, *Conn) {
@@ -272,7 +279,7 @@ func (p *policyConnPool) removeHost(addr string) {
 	delete(p.hostConnPools, addr)
 	p.mu.Unlock()
 
-	pool.Close()
+	go pool.Close()
 }
 
 func (p *policyConnPool) hostUp(host *HostInfo) {
@@ -374,8 +381,7 @@ func (pool *hostConnPool) Close() {
 	}
 	pool.closed = true
 
-	// drain, but don't wait
-	go pool.drain()
+	pool.drainLocked()
 }
 
 // Fill the connection pool
@@ -562,14 +568,10 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 	}
 }
 
-// removes and closes all connections from the pool
-func (pool *hostConnPool) drain() {
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
+func (pool *hostConnPool) drainLocked() {
 	// empty the pool
 	conns := pool.conns
-	pool.conns = pool.conns[:0:0]
+	pool.conns = nil
 
 	// update the policy
 	pool.policy.SetConns(nil)
@@ -578,4 +580,11 @@ func (pool *hostConnPool) drain() {
 	for _, conn := range conns {
 		conn.Close()
 	}
+}
+
+// removes and closes all connections from the pool
+func (pool *hostConnPool) drain() {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	pool.drainLocked()
 }

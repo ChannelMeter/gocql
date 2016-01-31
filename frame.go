@@ -758,19 +758,19 @@ type preparedMetadata struct {
 }
 
 func (r preparedMetadata) String() string {
-	return fmt.Sprintf("[paging_metadata flags=0x%x pkey=%q paging_state=% X columns=%v]", r.flags, r.pkeyColumns, r.pagingState, r.columns)
+	return fmt.Sprintf("[prepared flags=0x%x pkey=%v paging_state=% X columns=%v col_count=%d actual_col_count=%d]", r.flags, r.pkeyColumns, r.pagingState, r.columns, r.colCount, r.actualColCount)
 }
 
 func (f *framer) parsePreparedMetadata() preparedMetadata {
 	// TODO: deduplicate this from parseMetadata
 	meta := preparedMetadata{}
-	meta.flags = f.readInt()
 
-	colCount := f.readInt()
-	if colCount < 0 {
-		panic(fmt.Errorf("received negative column count: %d", colCount))
+	meta.flags = f.readInt()
+	meta.colCount = f.readInt()
+	if meta.colCount < 0 {
+		panic(fmt.Errorf("received negative column count: %d", meta.colCount))
 	}
-	meta.actualColCount = colCount
+	meta.actualColCount = meta.colCount
 
 	if f.proto >= protoVersion4 {
 		pkeyCount := f.readInt()
@@ -797,16 +797,16 @@ func (f *framer) parsePreparedMetadata() preparedMetadata {
 	}
 
 	var cols []ColumnInfo
-	if colCount < 1000 {
+	if meta.colCount < 1000 {
 		// preallocate columninfo to avoid excess copying
-		cols = make([]ColumnInfo, colCount)
-		for i := 0; i < colCount; i++ {
+		cols = make([]ColumnInfo, meta.colCount)
+		for i := 0; i < meta.colCount; i++ {
 			f.readCol(&cols[i], &meta.resultMetadata, globalSpec, keyspace, table)
 		}
 	} else {
 		// use append, huge number of columns usually indicates a corrupt frame or
 		// just a huge row.
-		for i := 0; i < colCount; i++ {
+		for i := 0; i < meta.colCount; i++ {
 			var col ColumnInfo
 			f.readCol(&col, &meta.resultMetadata, globalSpec, keyspace, table)
 			cols = append(cols, col)
@@ -824,7 +824,8 @@ type resultMetadata struct {
 	// only if flagPageState
 	pagingState []byte
 
-	columns []ColumnInfo
+	columns  []ColumnInfo
+	colCount int
 
 	// this is a count of the total number of columns which can be scanned,
 	// it is at minimum len(columns) but may be larger, for instance when a column
@@ -856,15 +857,14 @@ func (f *framer) readCol(col *ColumnInfo, meta *resultMetadata, globalSpec bool,
 }
 
 func (f *framer) parseResultMetadata() resultMetadata {
-	meta := resultMetadata{
-		flags: f.readInt(),
-	}
+	var meta resultMetadata
 
-	colCount := f.readInt()
-	if colCount < 0 {
-		panic(fmt.Errorf("received negative column count: %d", colCount))
+	meta.flags = f.readInt()
+	meta.colCount = f.readInt()
+	if meta.colCount < 0 {
+		panic(fmt.Errorf("received negative column count: %d", meta.colCount))
 	}
-	meta.actualColCount = colCount
+	meta.actualColCount = meta.colCount
 
 	if meta.flags&flagHasMorePages == flagHasMorePages {
 		meta.pagingState = f.readBytes()
@@ -882,17 +882,17 @@ func (f *framer) parseResultMetadata() resultMetadata {
 	}
 
 	var cols []ColumnInfo
-	if colCount < 1000 {
+	if meta.colCount < 1000 {
 		// preallocate columninfo to avoid excess copying
-		cols = make([]ColumnInfo, colCount)
-		for i := 0; i < colCount; i++ {
+		cols = make([]ColumnInfo, meta.colCount)
+		for i := 0; i < meta.colCount; i++ {
 			f.readCol(&cols[i], &meta, globalSpec, keyspace, table)
 		}
 
 	} else {
 		// use append, huge number of columns usually indicates a corrupt frame or
 		// just a huge row.
-		for i := 0; i < colCount; i++ {
+		for i := 0; i < meta.colCount; i++ {
 			var col ColumnInfo
 			f.readCol(&col, &meta, globalSpec, keyspace, table)
 			cols = append(cols, col)
@@ -935,7 +935,8 @@ type resultRowsFrame struct {
 	frameHeader
 
 	meta resultMetadata
-	rows [][][]byte
+	// dont parse the rows here as we only need to do it once
+	numRows int
 }
 
 func (f *resultRowsFrame) String() string {
@@ -943,28 +944,15 @@ func (f *resultRowsFrame) String() string {
 }
 
 func (f *framer) parseResultRows() frame {
-	meta := f.parseResultMetadata()
+	result := &resultRowsFrame{}
+	result.meta = f.parseResultMetadata()
 
-	numRows := f.readInt()
-	if numRows < 0 {
-		panic(fmt.Errorf("invalid row_count in result frame: %d", numRows))
+	result.numRows = f.readInt()
+	if result.numRows < 0 {
+		panic(fmt.Errorf("invalid row_count in result frame: %d", result.numRows))
 	}
 
-	colCount := len(meta.columns)
-
-	rows := make([][][]byte, numRows)
-	for i := 0; i < numRows; i++ {
-		rows[i] = make([][]byte, colCount)
-		for j := 0; j < colCount; j++ {
-			rows[i][j] = f.readBytes()
-		}
-	}
-
-	return &resultRowsFrame{
-		frameHeader: *f.header,
-		meta:        meta,
-		rows:        rows,
-	}
+	return result
 }
 
 type resultKeyspaceFrame struct {
@@ -1007,18 +995,6 @@ func (f *framer) parseResultPrepared() frame {
 	return frame
 }
 
-type resultSchemaChangeFrame struct {
-	frameHeader
-
-	change   string
-	keyspace string
-	table    string
-}
-
-func (s *resultSchemaChangeFrame) String() string {
-	return fmt.Sprintf("[result_schema_change change=%s keyspace=%s table=%s]", s.change, s.keyspace, s.table)
-}
-
 type schemaChangeKeyspace struct {
 	frameHeader
 
@@ -1053,15 +1029,24 @@ type schemaChangeFunction struct {
 
 func (f *framer) parseResultSchemaChange() frame {
 	if f.proto <= protoVersion2 {
-		frame := &resultSchemaChangeFrame{
-			frameHeader: *f.header,
+		change := f.readString()
+		keyspace := f.readString()
+		table := f.readString()
+
+		if table != "" {
+			return &schemaChangeTable{
+				frameHeader: *f.header,
+				change:      change,
+				keyspace:    keyspace,
+				object:      table,
+			}
+		} else {
+			return &schemaChangeKeyspace{
+				frameHeader: *f.header,
+				change:      change,
+				keyspace:    keyspace,
+			}
 		}
-
-		frame.change = f.readString()
-		frame.keyspace = f.readString()
-		frame.table = f.readString()
-
-		return frame
 	} else {
 		change := f.readString()
 		target := f.readString()
@@ -1341,6 +1326,12 @@ type frameWriter interface {
 	writeFrame(framer *framer, streamID int) error
 }
 
+type frameWriterFunc func(framer *framer, streamID int) error
+
+func (f frameWriterFunc) writeFrame(framer *framer, streamID int) error {
+	return f(framer, streamID)
+}
+
 type writeExecuteFrame struct {
 	preparedID []byte
 	params     queryParams
@@ -1560,18 +1551,27 @@ func (f *framer) readStringList() []string {
 	return l
 }
 
-func (f *framer) readBytes() []byte {
+func (f *framer) readBytesInternal() ([]byte, error) {
 	size := f.readInt()
 	if size < 0 {
-		return nil
+		return nil, nil
 	}
 
 	if len(f.rbuf) < size {
-		panic(fmt.Errorf("not enough bytes in buffer to read bytes require %d got: %d", size, len(f.rbuf)))
+		return nil, fmt.Errorf("not enough bytes in buffer to read bytes require %d got: %d", size, len(f.rbuf))
 	}
 
 	l := f.rbuf[:size]
 	f.rbuf = f.rbuf[size:]
+
+	return l, nil
+}
+
+func (f *framer) readBytes() []byte {
+	l, err := f.readBytesInternal()
+	if err != nil {
+		panic(err)
+	}
 
 	return l
 }
