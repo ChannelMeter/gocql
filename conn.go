@@ -1063,19 +1063,10 @@ func (c *Conn) awaitSchemaAgreement() (err error) {
 	return fmt.Errorf("gocql: cluster schema versions not consistent: %+v", schemas)
 }
 
-<<<<<<< HEAD
-type inflightPrepare struct {
-	info QueryInfo
-	err  error
-	wg   sync.WaitGroup
-}
-
 func ErrTimeoutNoResponse(host string) error {
 	return errors.New("gocql: no response received from cassandra within timeout period (" + host + ")")
 }
 
-=======
->>>>>>> cassandra3x/metadata
 var (
 	ErrQueryArgLength = errors.New("gocql: query argument length mismatch")
 	//ErrTimeoutNoResponse = errors.New("gocql: no response received from cassandra within timeout period")
