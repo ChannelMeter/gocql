@@ -498,8 +498,14 @@ func (s *Session) executeBatch(batch *Batch) *Iter {
 	var iter *Iter
 	batch.attempts = 0
 	batch.totalLatency = 0
+	// Do we need the lock here?
+	qry := &Query{stmt: batch.Entries[0].Stmt, values: batch.Entries[0].Args, cons: s.cons,
+		session: s, pageSize: s.pageSize, trace: s.trace,
+		prefetch: s.prefetch, rt: s.cfg.RetryPolicy, serialCons: s.cfg.SerialConsistency,
+		defaultTimestamp: s.cfg.DefaultTimestamp,
+	}
 	for {
-		host, conn := s.pool.Pick(nil)
+		host, conn := s.pool.Pick(qry)
 
 		batch.attempts++
 		if conn == nil {
