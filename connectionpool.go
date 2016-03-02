@@ -168,7 +168,7 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 	for addr := range toRemove {
 		pool := p.hostConnPools[addr]
 		delete(p.hostConnPools, addr)
-		pool.Close()
+		go pool.Close()
 	}
 
 	// update the policy
@@ -188,6 +188,13 @@ func (p *policyConnPool) Size() int {
 	p.mu.RUnlock()
 
 	return count
+}
+
+func (p *policyConnPool) getPool(addr string) (pool *hostConnPool, ok bool) {
+	p.mu.RLock()
+	pool, ok = p.hostConnPools[addr]
+	p.mu.RUnlock()
+	return
 }
 
 func (p *policyConnPool) Pick(qry *Query) (SelectedHost, *Conn) {
@@ -234,24 +241,22 @@ func (p *policyConnPool) Close() {
 
 func (p *policyConnPool) addHost(host *HostInfo) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	pool, ok := p.hostConnPools[host.Peer()]
-	if ok {
-		go pool.fill()
-		return
+	if !ok {
+		pool = newHostConnPool(
+			p.session,
+			host,
+			host.Port(), // TODO: if port == 0 use pool.port?
+			p.numConns,
+			p.keyspace,
+			p.connPolicy(),
+		)
+
+		p.hostConnPools[host.Peer()] = pool
 	}
+	p.mu.Unlock()
 
-	pool = newHostConnPool(
-		p.session,
-		host,
-		host.Port(),
-		p.numConns,
-		p.keyspace,
-		p.connPolicy(),
-	)
-
-	p.hostConnPools[host.Peer()] = pool
+	pool.fill()
 
 	// update policy
 	// TODO: policy should not have conns, it should have hosts and return a host
@@ -272,7 +277,7 @@ func (p *policyConnPool) removeHost(addr string) {
 	delete(p.hostConnPools, addr)
 	p.mu.Unlock()
 
-	pool.Close()
+	go pool.Close()
 }
 
 func (p *policyConnPool) hostUp(host *HostInfo) {
@@ -327,9 +332,7 @@ func newHostConnPool(session *Session, host *HostInfo, port, size int,
 		closed:   false,
 	}
 
-	// fill the pool with the initial connections before returning
-	pool.fill()
-
+	// the pool is not filled or connected
 	return pool
 }
 
@@ -374,8 +377,7 @@ func (pool *hostConnPool) Close() {
 	}
 	pool.closed = true
 
-	// drain, but don't wait
-	go pool.drain()
+	pool.drainLocked()
 }
 
 // Fill the connection pool
@@ -457,6 +459,9 @@ func (pool *hostConnPool) logConnectErr(err error) {
 	if opErr, ok := err.(*net.OpError); ok && (opErr.Op == "dial" || opErr.Op == "read") {
 		// connection refused
 		// these are typical during a node outage so avoid log spam.
+		if gocqlDebug {
+			log.Printf("unable to dial %q: %v\n", pool.host.Peer(), err)
+		}
 	} else if err != nil {
 		// unexpected error
 		log.Printf("error: failed to connect to %s due to error: %v", pool.addr, err)
@@ -494,16 +499,26 @@ func (pool *hostConnPool) connectMany(count int) {
 }
 
 // create a new connection to the host and add it to the pool
-func (pool *hostConnPool) connect() error {
+func (pool *hostConnPool) connect() (err error) {
+	// TODO: provide a more robust connection retry mechanism, we should also
+	// be able to detect hosts that come up by trying to connect to downed ones.
+	const maxAttempts = 3
 	// try to connect
-	conn, err := pool.session.connect(pool.addr, pool)
+	var conn *Conn
+	for i := 0; i < maxAttempts; i++ {
+		conn, err = pool.session.connect(pool.addr, pool, pool.host)
+		if err == nil {
+			break
+		}
+	}
+
 	if err != nil {
 		return err
 	}
 
 	if pool.keyspace != "" {
 		// set the keyspace
-		if err := conn.UseKeyspace(pool.keyspace); err != nil {
+		if err = conn.UseKeyspace(pool.keyspace); err != nil {
 			conn.Close()
 			return err
 		}
@@ -562,14 +577,10 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 	}
 }
 
-// removes and closes all connections from the pool
-func (pool *hostConnPool) drain() {
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
+func (pool *hostConnPool) drainLocked() {
 	// empty the pool
 	conns := pool.conns
-	pool.conns = pool.conns[:0:0]
+	pool.conns = nil
 
 	// update the policy
 	pool.policy.SetConns(nil)
@@ -578,4 +589,11 @@ func (pool *hostConnPool) drain() {
 	for _, conn := range conns {
 		conn.Close()
 	}
+}
+
+// removes and closes all connections from the pool
+func (pool *hostConnPool) drain() {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	pool.drainLocked()
 }

@@ -401,6 +401,13 @@ func bytesToInt64(data []byte) (ret int64) {
 	return ret
 }
 
+func bytesToUint64(data []byte) (ret uint64) {
+	for i := range data {
+		ret |= uint64(data[i]) << (8 * uint(len(data)-i-1))
+	}
+	return ret
+}
+
 func unmarshalBigInt(info TypeInfo, data []byte, value interface{}) error {
 	return unmarshalIntlike(info, decBigInt(data), data, value)
 }
@@ -410,9 +417,14 @@ func unmarshalInt(info TypeInfo, data []byte, value interface{}) error {
 }
 
 func unmarshalVarint(info TypeInfo, data []byte, value interface{}) error {
-	switch value.(type) {
+	switch v := value.(type) {
 	case *big.Int:
 		return unmarshalIntlike(info, 0, data, value)
+	case *uint64:
+		if len(data) == 9 && data[0] == 0 {
+			*v = bytesToUint64(data[1:])
+			return nil
+		}
 	}
 
 	if len(data) > 8 {
@@ -1521,6 +1533,11 @@ func unmarshalUDT(info TypeInfo, data []byte, value interface{}) error {
 
 	udt := info.(UDTTypeInfo)
 	for _, e := range udt.Elements {
+		if len(data) < 4 {
+			// UDT def does not match the column value
+			return nil
+		}
+
 		size := readInt(data[:4])
 		data = data[4:]
 
@@ -1532,7 +1549,7 @@ func unmarshalUDT(info TypeInfo, data []byte, value interface{}) error {
 			}
 
 			if !f.IsValid() || !f.CanAddr() {
-				return unmarshalErrorf("cannot unmarshal %s into %T", info, value)
+				return unmarshalErrorf("cannot unmarshal %s into %T: field %v is not valid", info, value, e.Name)
 			}
 
 			fk := f.Addr().Interface()

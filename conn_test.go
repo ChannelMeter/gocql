@@ -341,6 +341,58 @@ func TestQueryTimeout(t *testing.T) {
 	}
 }
 
+func TestQueryTimeoutMany(t *testing.T) {
+	srv := NewTestServer(t, 3)
+	defer srv.Stop()
+
+	cluster := testCluster(srv.Address, 3)
+	// Set the timeout arbitrarily low so that the query hits the timeout in a
+	// timely manner.
+	cluster.Timeout = 5 * time.Millisecond
+	cluster.NumConns = 1
+
+	db, err := cluster.CreateSession()
+	if err != nil {
+		t.Fatalf("NewCluster: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 128; i++ {
+		err := db.Query("void").Exec()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}
+}
+
+func BenchmarkSingleConn(b *testing.B) {
+	srv := NewTestServer(b, 3)
+	defer srv.Stop()
+
+	cluster := testCluster(srv.Address, 3)
+	// Set the timeout arbitrarily low so that the query hits the timeout in a
+	// timely manner.
+	cluster.Timeout = 500 * time.Millisecond
+	cluster.NumConns = 1
+	db, err := cluster.CreateSession()
+	if err != nil {
+		b.Fatalf("NewCluster: %v", err)
+	}
+	defer db.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			err := db.Query("void").Exec()
+			if err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
 func TestQueryTimeoutReuseStream(t *testing.T) {
 	t.Skip("no longer tests anything")
 	// TODO(zariel): move this to conn test, we really just want to check what
@@ -401,6 +453,74 @@ func TestQueryTimeoutClose(t *testing.T) {
 
 	if err != ErrConnectionClosed {
 		t.Fatalf("expected to get %v got %v", ErrConnectionClosed, err)
+	}
+}
+
+func TestStream0(t *testing.T) {
+	const expErr = "gocql: error on stream 0:"
+
+	srv := NewTestServer(t, defaultProto)
+	defer srv.Stop()
+
+	errorHandler := connErrorHandlerFn(func(conn *Conn, err error, closed bool) {
+		if !srv.isClosed() && !strings.HasPrefix(err.Error(), expErr) {
+			t.Errorf("expected to get error prefix %q got %q", expErr, err.Error())
+		}
+	})
+
+	host := &HostInfo{peer: srv.Address}
+	conn, err := Connect(host, srv.Address, &ConnConfig{ProtoVersion: int(srv.protocol)}, errorHandler, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer := frameWriterFunc(func(f *framer, streamID int) error {
+		f.writeHeader(0, opError, 0)
+		f.writeInt(0)
+		f.writeString("i am a bad frame")
+		// f.wbuf[0] = 2
+		return f.finishWrite()
+	})
+
+	// need to write out an invalid frame, which we need a connection to do
+	framer, err := conn.exec(writer, nil)
+	if err == nil {
+		t.Fatal("expected to get an error on stream 0")
+	} else if !strings.HasPrefix(err.Error(), expErr) {
+		t.Fatalf("expected to get error prefix %q got %q", expErr, err.Error())
+	} else if framer != nil {
+		frame, err := framer.parseFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("got frame %v", frame)
+	}
+}
+
+func TestConnClosedBlocked(t *testing.T) {
+	// issue 664
+	const proto = 3
+
+	srv := NewTestServer(t, proto)
+	defer srv.Stop()
+	errorHandler := connErrorHandlerFn(func(conn *Conn, err error, closed bool) {
+		t.Log(err)
+	})
+
+	host := &HostInfo{peer: srv.Address}
+	conn, err := Connect(host, srv.Address, &ConnConfig{ProtoVersion: int(srv.protocol)}, errorHandler, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// This will block indefintaly if #664 is not fixed
+	err = conn.executeQuery(&Query{stmt: "void"}).Close()
+	if !strings.HasSuffix(err.Error(), "use of closed network connection") {
+		t.Fatalf("expected to get use of closed networking connection error got: %v\n", err)
 	}
 }
 
@@ -481,7 +601,9 @@ type TestServer struct {
 	protocol   byte
 	headerSize int
 
-	quit chan struct{}
+	quit   chan struct{}
+	mu     sync.Mutex
+	closed bool
 }
 
 func (srv *TestServer) serve() {
@@ -512,7 +634,20 @@ func (srv *TestServer) serve() {
 	}
 }
 
+func (srv *TestServer) isClosed() bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return srv.closed
+}
+
 func (srv *TestServer) Stop() {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.closed {
+		return
+	}
+	srv.closed = true
+
 	srv.listen.Close()
 	close(srv.quit)
 }
@@ -567,6 +702,9 @@ func (srv *TestServer) process(f *framer) {
 			f.writeHeader(0, opResult, head.stream)
 			f.writeInt(resultKindVoid)
 		}
+	case opError:
+		f.writeHeader(0, opError, head.stream)
+		f.wbuf = append(f.wbuf, f.rbuf...)
 	default:
 		f.writeHeader(0, opError, head.stream)
 		f.writeInt(0)

@@ -2,6 +2,7 @@ package gocql
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -29,10 +30,26 @@ type cassVersion struct {
 	Major, Minor, Patch int
 }
 
+func (c *cassVersion) Set(v string) error {
+	if v == "" {
+		return nil
+	}
+
+	return c.UnmarshalCQL(nil, []byte(v))
+}
+
 func (c *cassVersion) UnmarshalCQL(info TypeInfo, data []byte) error {
+	return c.unmarshal(data)
+}
+
+func (c *cassVersion) unmarshal(data []byte) error {
 	version := strings.TrimSuffix(string(data), "-SNAPSHOT")
 	version = strings.TrimPrefix(version, "v")
 	v := strings.Split(version, ".")
+
+	if len(v) < 2 {
+		return fmt.Errorf("invalid version string: %s", data)
+	}
 
 	var err error
 	c.Major, err = strconv.Atoi(v[0])
@@ -53,6 +70,17 @@ func (c *cassVersion) UnmarshalCQL(info TypeInfo, data []byte) error {
 	}
 
 	return nil
+}
+
+func (c cassVersion) Before(major, minor, patch int) bool {
+	if c.Major > major {
+		return true
+	} else if c.Minor > minor {
+		return true
+	} else if c.Patch > patch {
+		return true
+	}
+	return false
 }
 
 func (c cassVersion) String() string {
@@ -300,8 +328,16 @@ func (r *ringDescriber) GetHosts() (hosts []*HostInfo, partitioner string, err e
 		return r.prevHosts, r.prevPartitioner, nil
 	}
 
-	host := &HostInfo{port: r.session.cfg.Port}
-	for iter.Scan(&host.peer, &host.dataCenter, &host.rack, &host.hostId, &host.tokens, &host.version) {
+	var (
+		host         = &HostInfo{port: r.session.cfg.Port}
+		versionBytes []byte
+	)
+	for iter.Scan(&host.peer, &host.dataCenter, &host.rack, &host.hostId, &host.tokens, &versionBytes) {
+		if err = host.version.unmarshal(versionBytes); err != nil {
+			log.Printf("invalid peer entry: peer=%s host_id=%s tokens=%v version=%s\n", host.peer, host.hostId, host.tokens, versionBytes)
+			continue
+		}
+
 		if r.matchFilter(host) {
 			hosts = append(hosts, host)
 		}
@@ -345,10 +381,12 @@ func (r *ringDescriber) refreshRing() error {
 	// TODO: move this to session
 	// TODO: handle removing hosts here
 	for _, h := range hosts {
-		if host, ok := r.session.ring.addHostIfMissing(h); !ok {
-			r.session.pool.addHost(h)
-		} else {
-			host.update(h)
+		if r.session.cfg.HostFilter == nil || r.session.cfg.HostFilter.Accept(h) {
+			if host, ok := r.session.ring.addHostIfMissing(h); !ok {
+				r.session.pool.addHost(h)
+			} else {
+				host.update(h)
+			}
 		}
 	}
 

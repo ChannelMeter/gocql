@@ -80,6 +80,35 @@ func (e *eventDeouncer) debounce(frame frame) {
 	e.mu.Unlock()
 }
 
+func (s *Session) handleEvent(framer *framer) {
+	// TODO(zariel): need to debounce events frames, and possible also events
+	defer framerPool.Put(framer)
+
+	frame, err := framer.parseFrame()
+	if err != nil {
+		// TODO: logger
+		log.Printf("gocql: unable to parse event frame: %v\n", err)
+		return
+	}
+
+	if gocqlDebug {
+		log.Printf("gocql: handling frame: %v\n", frame)
+	}
+
+	// TODO: handle medatadata events
+	switch f := frame.(type) {
+	case *schemaChangeKeyspace, *schemaChangeFunction, *schemaChangeTable:
+		s.schemaEvents.debounce(frame)
+	case *topologyChangeEventFrame, *statusChangeEventFrame:
+		s.nodeEvents.debounce(frame)
+	default:
+		log.Printf("gocql: invalid event frame (%T): %v\n", f, f)
+	}
+}
+
+func (s *Session) handleSchemaEvent(frames []frame) {
+}
+
 func (s *Session) handleNodeEvent(frames []frame) {
 	type nodeEvent struct {
 		change string
@@ -111,6 +140,10 @@ func (s *Session) handleNodeEvent(frames []frame) {
 	}
 
 	for _, f := range events {
+		if gocqlDebug {
+			log.Printf("gocql: dispatching event: %+v\n", f)
+		}
+
 		switch f.change {
 		case "NEW_NODE":
 			s.handleNewNode(f.host, f.port, true)
@@ -125,30 +158,6 @@ func (s *Session) handleNodeEvent(frames []frame) {
 			s.handleNodeDown(f.host, f.port)
 		}
 	}
-}
-
-func (s *Session) handleEvent(framer *framer) {
-	// TODO(zariel): need to debounce events frames, and possible also events
-	defer framerPool.Put(framer)
-
-	frame, err := framer.parseFrame()
-	if err != nil {
-		// TODO: logger
-		log.Printf("gocql: unable to parse event frame: %v\n", err)
-		return
-	}
-
-	// TODO: handle medatadata events
-	switch f := frame.(type) {
-	case *schemaChangeKeyspace:
-	case *schemaChangeFunction:
-	case *schemaChangeTable:
-	case *topologyChangeEventFrame, *statusChangeEventFrame:
-		s.nodeEvents.debounce(frame)
-	default:
-		log.Printf("gocql: invalid event frame (%T): %v\n", f, f)
-	}
-
 }
 
 func (s *Session) handleNewNode(host net.IP, port int, waitForBinary bool) {
@@ -167,8 +176,17 @@ func (s *Session) handleNewNode(host net.IP, port int, waitForBinary bool) {
 		hostInfo = &HostInfo{peer: host.String(), port: port, state: NodeUp}
 	}
 
-	// TODO: remove this when the host selection policy is more sophisticated
-	if !s.cfg.Discovery.matchFilter(hostInfo) {
+	addr := host.String()
+	if s.cfg.IgnorePeerAddr && hostInfo.Peer() != addr {
+		hostInfo.setPeer(addr)
+	}
+
+	if s.cfg.HostFilter != nil {
+		if !s.cfg.HostFilter.Accept(hostInfo) {
+			return
+		}
+	} else if !s.cfg.Discovery.matchFilter(hostInfo) {
+		// TODO: remove this when the host selection policy is more sophisticated
 		return
 	}
 
@@ -177,12 +195,13 @@ func (s *Session) handleNewNode(host net.IP, port int, waitForBinary bool) {
 	}
 
 	// should this handle token moving?
-	if existing, ok := s.ring.addHostIfMissing(hostInfo); !ok {
+	if existing, ok := s.ring.addHostIfMissing(hostInfo); ok {
 		existing.update(hostInfo)
 		hostInfo = existing
 	}
 
 	s.pool.addHost(hostInfo)
+	hostInfo.setState(NodeUp)
 
 	if s.control != nil {
 		s.hostSource.refreshRing()
@@ -192,6 +211,17 @@ func (s *Session) handleNewNode(host net.IP, port int, waitForBinary bool) {
 func (s *Session) handleRemovedNode(ip net.IP, port int) {
 	// we remove all nodes but only add ones which pass the filter
 	addr := ip.String()
+
+	host := s.ring.getHost(addr)
+	if host == nil {
+		host = &HostInfo{peer: addr}
+	}
+
+	if s.cfg.HostFilter != nil && !s.cfg.HostFilter.Accept(host) {
+		return
+	}
+
+	host.setState(NodeDown)
 	s.pool.removeHost(addr)
 	s.ring.removeHost(addr)
 
@@ -202,8 +232,16 @@ func (s *Session) handleNodeUp(ip net.IP, port int, waitForBinary bool) {
 	addr := ip.String()
 	host := s.ring.getHost(addr)
 	if host != nil {
-		// TODO: remove this when the host selection policy is more sophisticated
-		if !s.cfg.Discovery.matchFilter(host) {
+		if s.cfg.IgnorePeerAddr && host.Peer() != addr {
+			host.setPeer(addr)
+		}
+
+		if s.cfg.HostFilter != nil {
+			if !s.cfg.HostFilter.Accept(host) {
+				return
+			}
+		} else if !s.cfg.Discovery.matchFilter(host) {
+			// TODO: remove this when the host selection policy is more sophisticated
 			return
 		}
 
@@ -211,8 +249,9 @@ func (s *Session) handleNodeUp(ip net.IP, port int, waitForBinary bool) {
 			time.Sleep(t)
 		}
 
-		host.setState(NodeUp)
+		host.setPort(port)
 		s.pool.hostUp(host)
+		host.setState(NodeUp)
 		return
 	}
 
@@ -222,9 +261,14 @@ func (s *Session) handleNodeUp(ip net.IP, port int, waitForBinary bool) {
 func (s *Session) handleNodeDown(ip net.IP, port int) {
 	addr := ip.String()
 	host := s.ring.getHost(addr)
-	if host != nil {
-		host.setState(NodeDown)
+	if host == nil {
+		host = &HostInfo{peer: addr}
 	}
 
+	if s.cfg.HostFilter != nil && !s.cfg.HostFilter.Accept(host) {
+		return
+	}
+
+	host.setState(NodeDown)
 	s.pool.hostDown(addr)
 }

@@ -6,39 +6,8 @@ package gocql
 
 import (
 	"errors"
-	"sync"
 	"time"
-
-	"github.com/channelmeter/gocql/internal/lru"
 )
-
-const defaultMaxPreparedStmts = 1000
-
-//Package global reference to Prepared Statements LRU
-var stmtsLRU preparedLRU
-
-//preparedLRU is the prepared statement cache
-type preparedLRU struct {
-	sync.Mutex
-	lru *lru.Cache
-}
-
-//Max adjusts the maximum size of the cache and cleans up the oldest records if
-//the new max is lower than the previous value. Not concurrency safe.
-func (p *preparedLRU) Max(max int) {
-	for p.lru.Len() > max {
-		p.lru.RemoveOldest()
-	}
-	p.lru.MaxEntries = max
-}
-
-func initStmtsLRU(max int) {
-	if stmtsLRU.lru != nil {
-		stmtsLRU.Max(max)
-	} else {
-		stmtsLRU.lru = lru.New(max)
-	}
-}
 
 // PoolConfig configures the connection pool used by the driver, it defaults to
 // using a round robbin host selection policy and a round robbin connection selection
@@ -120,6 +89,37 @@ type ClusterConfig struct {
 	// The maximum amount of time to wait for schema agreement in a cluster after
 	// receiving a schema change frame. (deault: 60s)
 	MaxWaitSchemaAgreement time.Duration
+
+	// HostFilter will filter all incoming events for host, any which dont pass
+	// the filter will be ignored. If set will take precedence over any options set
+	// via Discovery
+	HostFilter HostFilter
+
+	// If IgnorePeerAddr is true and the address in system.peers does not match
+	// the supplied host by either initial hosts or discovered via events then the
+	// host will be replaced with the supplied address.
+	//
+	// For example if an event comes in with host=10.0.0.1 but when looking up that
+	// address in system.local or system.peers returns 127.0.0.1, the peer will be
+	// set to 10.0.0.1 which is what will be used to connect to.
+	IgnorePeerAddr bool
+
+	// If DisableInitialHostLookup then the driver will not attempt to get host info
+	// from the system.peers table, this will mean that the driver will connect to
+	// hosts supplied and will not attempt to lookup the hosts information, this will
+	// mean that data_centre, rack and token information will not be available and as
+	// such host filtering and token aware query routing will not be available.
+	DisableInitialHostLookup bool
+
+	// Configure events the driver will register for
+	Events struct {
+		// disable registering for status events (node up/down)
+		DisableNodeStatusEvents bool
+		// disable registering for topology events (node added/removed/moved)
+		DisableTopologyEvents bool
+		// disable registering for schema events (keyspace/table/function removed/created/updated)
+		DisableSchemaEvents bool
+	}
 
 	// internal config for testing
 	disableControlConn bool

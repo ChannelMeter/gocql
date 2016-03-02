@@ -22,10 +22,14 @@ var (
 	flagRunAuthTest  = flag.Bool("runauth", false, "Set to true to run authentication test")
 	flagCompressTest = flag.String("compressor", "", "compressor to use")
 	flagTimeout      = flag.Duration("gocql.timeout", 5*time.Second, "sets the connection `timeout` for all operations")
-	clusterHosts     []string
+
+	flagCassVersion cassVersion
+	clusterHosts    []string
 )
 
 func init() {
+	flag.Var(&flagCassVersion, "gocql.cversion", "the cassandra version being tested against")
+
 	flag.Parse()
 	clusterHosts = strings.Split(*flagCluster, ",")
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
@@ -46,11 +50,19 @@ func addSslOptions(cluster *ClusterConfig) *ClusterConfig {
 var initOnce sync.Once
 
 func createTable(s *Session, table string) error {
-	if err := s.control.query(table).Close(); err != nil {
+	// lets just be really sure
+	if err := s.control.awaitSchemaAgreement(); err != nil {
+		log.Printf("error waiting for schema agreement pre create table=%q err=%v\n", table, err)
+		return err
+	}
+
+	if err := s.Query(table).RetryPolicy(nil).Exec(); err != nil {
+		log.Printf("error creating table table=%q err=%v\n", table, err)
 		return err
 	}
 
 	if err := s.control.awaitSchemaAgreement(); err != nil {
+		log.Printf("error waiting for schema agreement post create table=%q err=%v\n", table, err)
 		return err
 	}
 
@@ -83,32 +95,27 @@ func createCluster() *ClusterConfig {
 func createKeyspace(tb testing.TB, cluster *ClusterConfig, keyspace string) {
 	c := *cluster
 	c.Keyspace = "system"
-	c.Timeout = 20 * time.Second
+	c.Timeout = 30 * time.Second
 	session, err := c.CreateSession()
 	if err != nil {
-		tb.Fatal("createSession:", err)
+		panic(err)
 	}
 	defer session.Close()
 	defer log.Println("closing keyspace session")
 
-	err = session.control.query(`DROP KEYSPACE IF EXISTS ` + keyspace).Close()
+	err = createTable(session, `DROP KEYSPACE IF EXISTS `+keyspace)
 	if err != nil {
-		tb.Fatal(err)
+		panic(fmt.Sprintf("unable to drop keyspace: %v", err))
 	}
 
-	err = session.control.query(fmt.Sprintf(`CREATE KEYSPACE %s
+	err = createTable(session, fmt.Sprintf(`CREATE KEYSPACE %s
 	WITH replication = {
 		'class' : 'SimpleStrategy',
 		'replication_factor' : %d
-	}`, keyspace, *flagRF)).Close()
+	}`, keyspace, *flagRF))
 
 	if err != nil {
-		tb.Fatal(err)
-	}
-
-	// lets just be sure
-	if err := session.control.awaitSchemaAgreement(); err != nil {
-		tb.Fatal(err)
+		panic(fmt.Sprintf("unable to create keyspace: %v", err))
 	}
 }
 
@@ -123,6 +130,10 @@ func createSessionFromCluster(cluster *ClusterConfig, tb testing.TB) *Session {
 	session, err := cluster.CreateSession()
 	if err != nil {
 		tb.Fatal("createSession:", err)
+	}
+
+	if err := session.control.awaitSchemaAgreement(); err != nil {
+		tb.Fatal(err)
 	}
 
 	return session
