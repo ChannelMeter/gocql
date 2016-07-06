@@ -835,6 +835,9 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 				c.session.reporter.statter.Timing("write.latency", ttms, 1.0)
 			}
 		}
+		if c.session.reporter.slowLog != nil && queryTtms > 500*time.Millisecond {
+			c.session.reporter.slowLog.Printf("Query '%s' with arguments '%v' took %v.", qry.stmt, qry.values, queryTtms)
+		}
 	}
 
 	switch x := resp.(type) {
