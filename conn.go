@@ -804,11 +804,14 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		}
 	}
 
+	queryStart := time.Now()
+
 	framer, err := c.exec(qry.context, frame, qry.trace)
 	if err != nil {
 		return &Iter{err: err}
 	}
 
+	queryTtms := time.Since(queryStart)
 	resp, err := framer.parseFrame()
 	if err != nil {
 		return &Iter{err: err}
@@ -816,6 +819,19 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 
 	if len(framer.traceID) > 0 {
 		qry.trace.Trace(framer.traceID)
+	}
+
+	switch resp.(type) {
+	case *resultRowsFrame, *resultVoidFrame:
+		ttms := int64(queryTtms.Seconds() * 1000)
+		c.session.reporter.statter.Timing("latency", ttms, 1.0)
+		if qry.shouldPrepare() {
+			if qry.isRead() {
+				c.session.reporter.statter.Timing("read.latency", ttms, 1.0)
+			} else {
+				c.session.reporter.statter.Timing("write.latency", ttms, 1.0)
+			}
+		}
 	}
 
 	switch x := resp.(type) {

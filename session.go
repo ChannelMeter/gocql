@@ -67,6 +67,8 @@ type Session struct {
 
 	closeMu  sync.RWMutex
 	isClosed bool
+
+	reporter StatsReporter
 }
 
 var queryPool = &sync.Pool{
@@ -109,6 +111,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		pageSize: cfg.PageSize,
 		stmtsLRU: &preparedLRU{lru: lru.New(cfg.MaxPreparedStmts)},
 	}
+	s.reportingInit()
 
 	connCfg, err := connConfig(s)
 	if err != nil {
@@ -795,6 +798,28 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 	}
 	routingKey := buf.Bytes()
 	return routingKey, nil
+}
+
+func (q *Query) isRead() bool {
+
+	stmt := strings.TrimLeftFunc(strings.TrimRightFunc(q.stmt, func(r rune) bool {
+		return unicode.IsSpace(r) || r == ';'
+	}), unicode.IsSpace)
+
+	var stmtType string
+	if n := strings.IndexFunc(stmt, unicode.IsSpace); n >= 0 {
+		stmtType = strings.ToLower(stmt[:n])
+	}
+	if stmtType == "begin" {
+		if n := strings.LastIndexFunc(stmt, unicode.IsSpace); n >= 0 {
+			stmtType = strings.ToLower(stmt[n+1:])
+		}
+	}
+	switch stmtType {
+	case "select":
+		return true
+	}
+	return false
 }
 
 func (q *Query) shouldPrepare() bool {
