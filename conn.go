@@ -824,6 +824,7 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 	switch resp.(type) {
 	case *resultRowsFrame, *resultVoidFrame:
 		ttms := int64(queryTtms.Seconds() * 1000)
+		c.session.reporter.statter.Inc("count", 1, 1.0)
 		c.session.reporter.statter.Timing("latency", ttms, 1.0)
 		if qry.shouldPrepare() {
 			if qry.isRead() {
