@@ -828,8 +828,10 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 		c.session.reporter.statter.Timing("latency", ttms, 1.0)
 		if qry.shouldPrepare() {
 			if qry.isRead() {
+				c.session.reporter.statter.Inc("read.count", 1, 1.0)
 				c.session.reporter.statter.Timing("read.latency", ttms, 1.0)
 			} else {
+				c.session.reporter.statter.Inc("write.count", 1, 1.0)
 				c.session.reporter.statter.Timing("write.latency", ttms, 1.0)
 			}
 		}
