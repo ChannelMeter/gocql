@@ -836,7 +836,7 @@ func (c *Conn) executeQuery(qry *Query) *Iter {
 			}
 		}
 		if c.session.reporter.slowLog != nil && queryTtms > 500*time.Millisecond {
-			c.session.reporter.slowLog.Printf("Query '%s' with arguments '%v' took %v.", qry.stmt, qry.values, queryTtms)
+			c.session.reporter.slowLog.Printf("Query '%s' with arguments '%v' to %v took %v.", qry.stmt, qry.values, c.addr, queryTtms)
 		}
 	}
 
